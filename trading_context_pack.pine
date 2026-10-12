@@ -43,7 +43,7 @@ string lowerTfDelta      = input.timeframe("1", "Delta: lower timeframe", group 
 bool   resetSessionDelta = input.bool(true, "Delta: reset cumulative each session", group = "Delta")
 
 // -- FVG (Fair Value Gap) --
-bool  showFVG      = input.bool(true, "FVG: show", group = "FVG")
+bool  showFVG      = input.bool(false, "FVG: show (legacy chart-only)", tooltip = "Superseded by the MTF Engine chart-TF layer, which keeps zones until invalidated instead of deleting them on first fill. Kept for comparison.", group = "FVG")
 int   fvgBoxWidth  = input.int(10, "FVG: box width (bars)", minval = 1, maxval = 200, tooltip = "Fixed width for each gap box, like a standard FVG indicator -- it does not keep stretching forward until filled.", group = "FVG")
 int   maxFVGBoxes  = input.int(20, "FVG: max active gaps shown per side", minval = 1, maxval = 100, tooltip = "Oldest unfilled gap is dropped once this is exceeded.", group = "FVG")
 color fvgBullColor = input.color(color.new(color.green, 70), "FVG: bullish color", group = "FVG")
@@ -55,7 +55,7 @@ int  pivotLen   = input.int(5, "Supply/Demand: pivot strength (bars each side)",
 int  maxSDZones = input.int(10, "Supply/Demand: max zones per side", minval = 1, maxval = 50, group = "Supply/Demand")
 
 // -- Order Block --
-bool  showOB           = input.bool(true, "Order Block: show", group = "Order Block")
+bool  showOB           = input.bool(false, "Order Block: show (legacy chart-only)", tooltip = "Superseded by the MTF Engine chart-TF layer (OB requires a BOS, kept until invalidated). Kept for comparison.", group = "Order Block")
 int   obBoxWidth       = input.int(15, "Order Block: box width (bars)", minval = 1, maxval = 200, tooltip = "Fixed width, same idea as FVG width -- doesn't stretch forward until mitigated.", group = "Order Block")
 float obImpulseAtrMult = input.float(1.5, "Order Block: impulse strength (x ATR)", minval = 0.5, step = 0.1, tooltip = "How much bigger than a typical recent candle the breakout candle must be to count as impulsive.", group = "Order Block")
 int   maxOBBoxes       = input.int(15, "Order Block: max active blocks per side", minval = 1, maxval = 50, group = "Order Block")
@@ -923,6 +923,273 @@ bool mtfHtfNew = mtfHtfOn and not na(hTm) and hTm != mtfLastHtfT
 var int mtfLastLtfT = 0
 var int mtfLtfMissing = 0
 
+// ============================= MTF ENGINE: DISPLAY INPUTS =============================
+color mtfBullCol    = input.color(color.new(color.teal, 82), "Bullish zone", inline = "zc", group = "MTF Display")
+color mtfBearCol    = input.color(color.new(color.red, 82), "Bearish zone", inline = "zc", group = "MTF Display")
+int   mtfMaxZones   = input.int(12, "Max active zones per layer", minval = 1, maxval = 60, tooltip = "Oldest zone is dropped (validity = Dropped) once exceeded.", group = "MTF Display")
+bool  mtfShowSwings = input.bool(true, "Show swing high/low lines", group = "MTF Display")
+int   mtfMaxSwings  = input.int(6, "Max swing lines per layer", minval = 1, maxval = 30, group = "MTF Display")
+
+// ============================= MTF ENGINE: STATE OBJECTS =============================
+// Three independent state machines -- one never implies another:
+//   1. Zone VALIDITY   (validity):  Active -> Invalidated (body close beyond far edge) or Dropped
+//                                   (trimmed by the cap). Flipped = polarity-flipped IFVG/Breaker
+//                                   (Phase 5). Only validity removes a zone.
+//   2. Zone INTERACTION (facts):    touchCount, firstTouchTime, ceTouched, deepestPen, filled.
+//                                   A touched / CE-hit / filled zone stays valid.
+//   3. SETUP lifecycle (MtfSetup):  Armed -> Triggered -> Open -> Closed(TP/SL/TimeExit), or
+//                                   Expired / Cancelled / Rejected before a fill.
+type MtfZone
+    int    id
+    float  top
+    float  bot
+    int    dir
+    string kind
+    string tf
+    int    layer
+    int    originTime
+    int    confirmTime
+    string validity       = "Active"
+    int    touchCount     = 0
+    int    firstTouchTime = na
+    bool   ceTouched      = false
+    float  deepestPen     = 0.0
+    bool   filled         = false
+    bool   inside         = false
+    bool   newTouch       = false
+    int    setupCount     = 0
+    bool   setupLive      = false
+    float  relVol         = na
+    box    bx             = na
+    line   ce             = na
+    label  lb             = na
+
+type MtfSwing
+    float price
+    int   dir
+    int   layer
+    int   pivotTime
+    int   confirmTime
+    bool  taken = false
+    line  ln    = na
+    label lb    = na
+
+type MtfSetup
+    int     id
+    MtfZone z
+    int     dir
+    string  state           = "Armed"
+    string  reason          = ""
+    float   aoiTop
+    float   aoiBot
+    int     armBar
+    int     trigBar         = na
+    int     trigTime        = na
+    float   trigClose       = na
+    float   stop            = na
+    float   target          = na
+    float   entry           = na
+    int     entryBar        = na
+    int     entryTime       = na
+    float   exitPrice       = na
+    int     exitBar         = na
+    float   rMult           = na
+    float   mae             = 0.0
+    float   mfe             = 0.0
+    bool    ambiguous       = false
+    bool    timeExitPending = false
+    bool    counted         = false
+    bool    fStruct         = false
+    bool    fSweep          = false
+    bool    fPD             = false
+    bool    fDisp           = false
+    bool    fCE             = false
+    string  session         = ""
+
+// Layers: 0 = LTF, 1 = chart TF, 2 = HTF.
+var array<MtfZone>  mtfZonesL = array.new<MtfZone>()
+var array<MtfZone>  mtfZonesC = array.new<MtfZone>()
+var array<MtfZone>  mtfZonesH = array.new<MtfZone>()
+var array<MtfSwing> mtfSwL    = array.new<MtfSwing>()
+var array<MtfSwing> mtfSwC    = array.new<MtfSwing>()
+var array<MtfSwing> mtfSwH    = array.new<MtfSwing>()
+var array<int>      mtfIdCtr  = array.from(0)
+
+mtf_layerShow(int layer) =>
+    layer == 2 ? mtfShowHtf : layer == 1 ? mtfShowCtf : mtfShowLtf
+
+mtf_kill(MtfZone z) =>
+    if not na(z.bx)
+        box.delete(z.bx)
+    if not na(z.ce)
+        line.delete(z.ce)
+    if not na(z.lb)
+        label.delete(z.lb)
+
+// HTF = thick solid border, chart TF = thin solid, LTF = dashed; flipped zones = dotted.
+mtf_draw(MtfZone z) =>
+    if mtf_layerShow(z.layer)
+        bool   isFlip = z.kind == "IFVG" or z.kind == "Breaker"
+        color  fillC  = z.dir == 1 ? mtfBullCol : mtfBearCol
+        color  edgeC  = color.new(fillC, 20)
+        string bStyle = isFlip ? line.style_dotted : z.layer == 0 ? line.style_dashed : line.style_solid
+        float  mid    = (z.top + z.bot) / 2
+        string txt    = z.tf + " " + z.kind + (str.contains(z.kind, "OB") or z.kind == "Breaker" ? (na(z.relVol) ? "" : " " + str.tostring(z.relVol, "#.#") + "x") : "")
+        z.bx := box.new(z.originTime, z.top, time, z.bot, xloc = xloc.bar_time, border_color = edgeC, border_width = z.layer == 2 ? 2 : 1, border_style = bStyle, bgcolor = fillC)
+        z.ce := line.new(z.originTime, mid, time, mid, xloc = xloc.bar_time, color = edgeC, style = line.style_dotted, width = 1)
+        z.lb := label.new(z.originTime, z.dir == 1 ? z.bot : z.top, txt, xloc = xloc.bar_time, style = z.dir == 1 ? label.style_label_upper_left : label.style_label_lower_left, color = color.new(color.black, 100), textcolor = edgeC, size = size.tiny)
+
+mtf_addZone(array<MtfZone> arr, float top, float bot, int dir, string kind, int layer, string tf, int originT, float relVol) =>
+    int nid = array.get(mtfIdCtr, 0) + 1
+    array.set(mtfIdCtr, 0, nid)
+    MtfZone z = MtfZone.new(id = nid, top = top, bot = bot, dir = dir, kind = kind, tf = tf, layer = layer, originTime = na(originT) ? time : originT, confirmTime = time, relVol = relVol)
+    // Price already inside at creation does not count as a touch: a touch needs price to
+    // leave and come back (this is also what makes a flipped zone's first touch a "retest").
+    z.inside := high >= bot and low <= top
+    mtf_draw(z)
+    array.push(arr, z)
+    if array.size(arr) > mtfMaxZones
+        MtfZone old = array.shift(arr)
+        old.validity := "Dropped"
+        mtf_kill(old)
+    z
+
+// Updates interaction facts, then validity, using this (closed) bar. Zones that flip are
+// collected first and created after the loop so the array isn't resized mid-iteration.
+mtf_updateZones(array<MtfZone> arr, bool flipOn) =>
+    array<MtfZone> flips = array.new<MtfZone>()
+    int n = array.size(arr)
+    if n > 0
+        for i = n - 1 to 0
+            MtfZone z = array.get(arr, i)
+            bool touching = high >= z.bot and low <= z.top
+            z.newTouch := touching and not z.inside
+            if z.newTouch
+                z.touchCount += 1
+                if na(z.firstTouchTime)
+                    z.firstTouchTime := time
+            z.inside := touching
+            float mid = (z.top + z.bot) / 2
+            if high >= mid and low <= mid
+                z.ceTouched := true
+            float h = z.top - z.bot
+            if touching and h > 0
+                float pen = z.dir == 1 ? (z.top - low) / h : (high - z.bot) / h
+                z.deepestPen := math.max(z.deepestPen, math.min(pen, 9.99))
+            if (z.kind == "FVG" or z.kind == "IFVG") and (z.dir == 1 ? low <= z.bot : high >= z.top)
+                z.filled := true
+            bool broken = z.dir == 1 ? close < z.bot : close > z.top
+            if broken
+                z.validity := "Invalidated"
+                mtf_kill(z)
+                array.remove(arr, i)
+                if flipOn and (z.kind == "FVG" or z.kind == "OB")
+                    array.push(flips, z)
+    if array.size(flips) > 0
+        for z in flips
+            MtfZone f = mtf_addZone(arr, z.top, z.bot, -z.dir, z.kind == "FVG" ? "IFVG" : "Breaker", z.layer, z.tf, time, z.relVol)
+            f.validity := "Flipped"
+
+mtf_addSwing(array<MtfSwing> arr, float price, int dir, int layer, string tf, int pivT) =>
+    MtfSwing s = MtfSwing.new(price = price, dir = dir, layer = layer, pivotTime = na(pivT) ? time : pivT, confirmTime = time)
+    if mtfShowSwings and mtf_layerShow(layer)
+        color c = dir == 1 ? color.new(color.red, 30) : color.new(color.teal, 30)
+        s.ln := line.new(s.pivotTime, price, time, price, xloc = xloc.bar_time, color = c, width = layer == 2 ? 2 : 1, style = layer == 0 ? line.style_dashed : line.style_solid)
+        s.lb := label.new(s.pivotTime, price, tf + (dir == 1 ? " SH" : " SL"), xloc = xloc.bar_time, style = dir == 1 ? label.style_label_down : label.style_label_up, color = color.new(color.black, 100), textcolor = c, size = size.tiny)
+    array.push(arr, s)
+    if array.size(arr) > mtfMaxSwings * 2
+        MtfSwing o = array.shift(arr)
+        if not na(o.ln)
+            line.delete(o.ln)
+        if not na(o.lb)
+            label.delete(o.lb)
+
+// A swing is "taken" when price trades through it (wick); its line freezes and turns dotted.
+mtf_updateSwings(array<MtfSwing> arr) =>
+    for s in arr
+        if not s.taken and (s.dir == 1 ? high > s.price : low < s.price)
+            s.taken := true
+            if not na(s.ln)
+                line.set_x2(s.ln, time)
+                line.set_style(s.ln, line.style_dotted)
+
+mtf_ingest(array<MtfZone> zs, array<MtfSwing> sw, int layer, string tf, float bFT, float bFB, float sFT, float sFB, int fT, float bOT, float bOB, float bOV, int bOTm, float sOT, float sOB, float sOV, int sOTm, float ph, float pl, int pT) =>
+    if not na(bFT)
+        mtf_addZone(zs, bFT, bFB, 1, "FVG", layer, tf, fT, na)
+    if not na(sFT)
+        mtf_addZone(zs, sFT, sFB, -1, "FVG", layer, tf, fT, na)
+    if not na(bOT)
+        mtf_addZone(zs, bOT, bOB, 1, "OB", layer, tf, bOTm, bOV)
+    if not na(sOT)
+        mtf_addZone(zs, sOT, sOB, -1, "OB", layer, tf, sOTm, sOV)
+    if not na(ph)
+        mtf_addSwing(sw, ph, 1, layer, tf, pT)
+    if not na(pl)
+        mtf_addSwing(sw, pl, -1, layer, tf, pT)
+
+mtf_extendRight(array<MtfZone> zs, array<MtfSwing> sw) =>
+    for z in zs
+        if not na(z.bx)
+            box.set_right(z.bx, time)
+        if not na(z.ce)
+            line.set_x2(z.ce, time)
+    for s in sw
+        if not s.taken and not na(s.ln)
+            line.set_x2(s.ln, time)
+
+// ============================= MTF ENGINE: PER-BAR ZONE UPDATE =============================
+// All state changes happen on CLOSED bars only, so nothing flickers or repaints in realtime.
+bool mtfFlipOn = false
+
+if barstate.isconfirmed
+    // 1) existing zones/swings react to this bar
+    mtf_updateZones(mtfZonesH, mtfFlipOn)
+    mtf_updateZones(mtfZonesC, mtfFlipOn)
+    mtf_updateZones(mtfZonesL, mtfFlipOn)
+    mtf_updateSwings(mtfSwH)
+    mtf_updateSwings(mtfSwC)
+    mtf_updateSwings(mtfSwL)
+    // 2) new events that became known on this bar
+    mtf_ingest(mtfZonesC, mtfSwC, 1, mtfCtfName, cBFT, cBFB, cSFT, cSFB, cFT, cBOT, cBOB, cBOV, cBOTm, cSOT, cSOB, cSOV, cSOTm, cPH, cPL, cPT)
+    if mtfHtfNew
+        mtfLastHtfT := hTm
+        mtf_ingest(mtfZonesH, mtfSwH, 2, mtfHtfName, hBFT, hBFB, hSFT, hSFB, hFT, hBOT, hBOB, hBOV, hBOTm, hSOT, hSOB, hSOV, hSOTm, hPH, hPL, hPT)
+    if mtfLtfOn
+        int nIntra = array.size(lTm)
+        if nIntra == 0
+            mtfLtfMissing += 1
+        else
+            // Gated by barstate.isconfirmed, so every intrabar in the array is closed; the
+            // time check stops an intrabar from ever being processed twice.
+            for i = 0 to nIntra - 1
+                int it = array.get(lTm, i)
+                if it > mtfLastLtfT
+                    mtfLastLtfT := it
+                    mtf_ingest(mtfZonesL, mtfSwL, 0, mtfLtfName, array.get(lBFT, i), array.get(lBFB, i), array.get(lSFT, i), array.get(lSFB, i), array.get(lFT, i), array.get(lBOT, i), array.get(lBOB, i), array.get(lBOV, i), array.get(lBOTm, i), array.get(lSOT, i), array.get(lSOB, i), array.get(lSOV, i), array.get(lSOTm, i), array.get(lPH, i), array.get(lPL, i), array.get(lPT, i))
+
+// Developing HTF zones: hollow grey, last bar only, never stored.
+var array<box> mtfDevBoxes = array.new<box>()
+if barstate.islast
+    for b in mtfDevBoxes
+        box.delete(b)
+    array.clear(mtfDevBoxes)
+    mtf_extendRight(mtfZonesH, mtfSwH)
+    mtf_extendRight(mtfZonesC, mtfSwC)
+    mtf_extendRight(mtfZonesL, mtfSwL)
+    if mtfShowDev and mtfHtfOn
+        color devC = color.new(color.gray, 30)
+        if not na(dBFT)
+            array.push(mtfDevBoxes, box.new(dFT, dBFT, time, dBFB, xloc = xloc.bar_time, border_color = devC, border_style = line.style_dashed, bgcolor = color.new(color.gray, 100), text = mtfHtfName + " FVG (developing)", text_size = size.tiny, text_color = devC))
+        if not na(dSFT)
+            array.push(mtfDevBoxes, box.new(dFT, dSFT, time, dSFB, xloc = xloc.bar_time, border_color = devC, border_style = line.style_dashed, bgcolor = color.new(color.gray, 100), text = mtfHtfName + " FVG (developing)", text_size = size.tiny, text_color = devC))
+        if not na(dBOT)
+            array.push(mtfDevBoxes, box.new(dBOTm, dBOT, time, dBOB, xloc = xloc.bar_time, border_color = devC, border_style = line.style_dashed, bgcolor = color.new(color.gray, 100), text = mtfHtfName + " OB (developing)", text_size = size.tiny, text_color = devC))
+        if not na(dSOT)
+            array.push(mtfDevBoxes, box.new(dSOTm, dSOT, time, dSOB, xloc = xloc.bar_time, border_color = devC, border_style = line.style_dashed, bgcolor = color.new(color.gray, 100), text = mtfHtfName + " OB (developing)", text_size = size.tiny, text_color = devC))
+
+mtf_zoneTxt(MtfZone z) =>
+    na(z) ? "none" : "#" + str.tostring(z.id) + " " + z.tf + " " + z.kind + (z.dir == 1 ? " bull" : " bear") + ": " + z.validity + ", touches " + str.tostring(z.touchCount) + (z.ceTouched ? ", CE hit" : "") + (z.filled ? ", filled" : "")
+
 // ==== ENGINE END (keep in sync) ====
 
 mtf_trendTxt(int t) =>
@@ -976,6 +1243,16 @@ if barstate.islast
     string alignTxt = mtfHtfTrend == 1 and cTrend == 1 and (not mtfLtfOn or mtfLtfTrend == 1) ? "Aligned Bull" : mtfHtfTrend == -1 and cTrend == -1 and (not mtfLtfOn or mtfLtfTrend == -1) ? "Aligned Bear" : "Mixed"
     table.cell(dash, 0, 13, "Alignment", text_color = color.white)
     table.cell(dash, 1, 13, alignTxt, text_color = alignTxt == "Aligned Bull" ? color.teal : alignTxt == "Aligned Bear" ? color.maroon : color.gray)
+
+    table.cell(dash, 0, 14, "Zones  LTF / Chart / HTF", text_color = color.white)
+    table.cell(dash, 1, 14, str.tostring(array.size(mtfZonesL)) + " / " + str.tostring(array.size(mtfZonesC)) + " / " + str.tostring(array.size(mtfZonesH)), text_color = color.gray)
+
+    table.cell(dash, 0, 15, "Newest HTF zone", text_color = color.white)
+    table.cell(dash, 1, 15, array.size(mtfZonesH) > 0 ? mtf_zoneTxt(array.last(mtfZonesH)) : "none", text_color = color.gray)
+
+    if mtfLtfMissing > 0
+        table.cell(dash, 0, 22, "LTF bars w/o intrabars", text_color = color.white)
+        table.cell(dash, 1, 22, str.tostring(mtfLtfMissing), text_color = color.gray)
 
     if mtfWarn != ""
         table.cell(dash, 0, 23, "Warning", text_color = color.yellow)
