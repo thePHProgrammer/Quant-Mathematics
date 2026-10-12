@@ -1,5 +1,5 @@
 //@version=6
-indicator("Trading Context Pack (COT + Volume Profile + Delta)", overlay = true, max_boxes_count = 500, max_labels_count = 200, max_lines_count = 100)
+indicator("Trading Context Pack (COT + Volume Profile + Delta)", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
 
 // ============================================================================
 // ONE indicator slot, no Premium/Ultimate required. Combines three things:
@@ -46,7 +46,8 @@ bool   resetSessionDelta = input.bool(true, "Delta: reset cumulative each sessio
 bool  showFVG      = input.bool(true, "FVG: show", group = "FVG")
 int   fvgBoxWidth  = input.int(10, "FVG: box width (bars)", minval = 1, maxval = 200, tooltip = "Fixed width for each gap box, like a standard FVG indicator -- it does not keep stretching forward until filled.", group = "FVG")
 int   maxFVGBoxes  = input.int(20, "FVG: max active gaps shown per side", minval = 1, maxval = 100, tooltip = "Oldest unfilled gap is dropped once this is exceeded.", group = "FVG")
-color fvgColor     = input.color(color.new(color.red, 70), "FVG: color", group = "FVG")
+color fvgBullColor = input.color(color.new(color.green, 70), "FVG: bullish color", group = "FVG")
+color fvgBearColor = input.color(color.new(color.red, 70), "FVG: bearish color", group = "FVG")
 
 // -- Supply/Demand (swing-based) --
 bool showSD     = input.bool(true, "Supply/Demand: show", group = "Supply/Demand")
@@ -464,8 +465,8 @@ if showFVG
     bool bearFVG = high < low[2]
 
     if bullFVG
-        box   newBox   = box.new(left = bar_index - 1, top = low, right = bar_index - 1 + fvgBoxWidth, bottom = high[2], bgcolor = fvgColor, border_width = 1, border_color = color.new(color.red, 30))
-        label newLabel = label.new(bar_index - 1, high[2], "FVG", style = label.style_label_up, color = color.new(color.red, 30), textcolor = color.white, size = size.tiny)
+        box   newBox   = box.new(left = bar_index - 1, top = low, right = bar_index - 1 + fvgBoxWidth, bottom = high[2], bgcolor = fvgBullColor, border_width = 1, border_color = color.new(color.green, 30))
+        label newLabel = label.new(bar_index - 1, high[2], "FVG", style = label.style_label_up, color = color.new(color.green, 30), textcolor = color.white, size = size.tiny)
         array.push(bullFvgBoxes, newBox)
         array.push(bullFvgLabels, newLabel)
         if array.size(bullFvgBoxes) > maxFVGBoxes
@@ -473,7 +474,7 @@ if showFVG
             label.delete(array.shift(bullFvgLabels))
 
     if bearFVG
-        box   newBox   = box.new(left = bar_index - 1, top = low[2], right = bar_index - 1 + fvgBoxWidth, bottom = high, bgcolor = fvgColor, border_width = 1, border_color = color.new(color.red, 30))
+        box   newBox   = box.new(left = bar_index - 1, top = low[2], right = bar_index - 1 + fvgBoxWidth, bottom = high, bgcolor = fvgBearColor, border_width = 1, border_color = color.new(color.red, 30))
         label newLabel = label.new(bar_index - 1, low[2], "FVG", style = label.style_label_down, color = color.new(color.red, 30), textcolor = color.white, size = size.tiny)
         array.push(bearFvgBoxes, newBox)
         array.push(bearFvgLabels, newLabel)
@@ -512,6 +513,11 @@ var array<label> demandLabels = array.new_label()
 var int supplyCount = 0
 var int demandCount = 0
 
+// Pivots are computed on every bar (outside the `if`) so their history is consistent even if
+// the section is toggled -- ta.* calls inside a conditional block only see the bars it ran on.
+float sdPH = ta.pivothigh(pivotLen, pivotLen)
+float sdPL = ta.pivotlow(pivotLen, pivotLen)
+
 if showSD
     if array.size(supplyZones) > 0
         for i = array.size(supplyZones) - 1 to 0
@@ -537,12 +543,9 @@ if showSD
             else
                 box.set_right(b, bar_index)
 
-    float ph = ta.pivothigh(pivotLen, pivotLen)
-    float pl = ta.pivotlow(pivotLen, pivotLen)
-
-    if not na(ph)
-        float newTop = ph
-        float newBot = ph - effectiveRowSize
+    if not na(sdPH)
+        float newTop = sdPH
+        float newBot = sdPH - effectiveRowSize
         if not overlapsExisting(supplyZones, newTop, newBot)
             int pivotBarIdx = bar_index - pivotLen
             box   newBox   = box.new(left = pivotBarIdx, top = newTop, right = bar_index, bottom = newBot, bgcolor = color.new(color.red, 82), border_width = 1, border_color = color.new(color.red, 40))
@@ -553,9 +556,9 @@ if showSD
                 box.delete(array.shift(supplyZones))
                 label.delete(array.shift(supplyLabels))
 
-    if not na(pl)
-        float newTop = pl + effectiveRowSize
-        float newBot = pl
+    if not na(sdPL)
+        float newTop = sdPL + effectiveRowSize
+        float newBot = sdPL
         if not overlapsExisting(demandZones, newTop, newBot)
             int pivotBarIdx = bar_index - pivotLen
             box   newBox   = box.new(left = pivotBarIdx, top = newTop, right = bar_index, bottom = newBot, bgcolor = color.new(color.green, 82), border_width = 1, border_color = color.new(color.green, 40))
@@ -680,8 +683,253 @@ float barDelta = array.sum(upVol) - array.sum(downVol)
 if not na(barDelta)
     cumDelta += barDelta
 
+// ==== ENGINE START (keep in sync) ====
+// Everything between the ENGINE START/END markers is shared verbatim with mtf_zone_strategy.pine.
+// Edit it here, then run `python3 tools/sync_engine.py` to copy it across. Names are prefixed
+// (mtf*/Mtf*) so the block never collides with the rest of the indicator. Full rule definitions:
+// docs/SPEC.md.
+
+// ============================= MTF ENGINE: INPUTS =============================
+string mtfMode     = input.string("Auto", "MTF: timeframe selection", options = ["Auto", "Manual"], tooltip = "Auto picks the higher/lower timeframe from a fixed lookup table based on the chart timeframe (see docs/SPEC.md). Manual uses the two fields below.", group = "MTF Engine")
+string mtfLtf1h    = input.string("5", "MTF: Auto LTF on a 1H chart", options = ["5", "15"], tooltip = "5m shows finer entry structure but more noise; 15m is cleaner but coarser.", group = "MTF Engine")
+string mtfHtfMan   = input.timeframe("60", "MTF: Manual higher timeframe", group = "MTF Engine")
+string mtfLtfMan   = input.timeframe("5", "MTF: Manual lower timeframe", group = "MTF Engine")
+bool   mtfShowHtf  = input.bool(true, "Show HTF layer", inline = "lay", group = "MTF Engine")
+bool   mtfShowCtf  = input.bool(true, "Chart TF layer", inline = "lay", group = "MTF Engine")
+bool   mtfShowLtf  = input.bool(true, "LTF layer", inline = "lay", group = "MTF Engine")
+bool   mtfShowDev  = input.bool(false, "Show developing (unconfirmed) HTF zones", tooltip = "Drawn hollow and grey on the last bar only. Never used by setups, scoring or alerts.", group = "MTF Engine")
+
+// ============================= MTF ENGINE: TIMEFRAME LADDER =============================
+// Explicit lookup: each chart timeframe maps to the largest table row that is <= it
+// ("nearest lower row"). "" means that layer is off for this row.
+//   chart:  1m  3m  5m  15m  30m  1H     4H  1D
+//   LTF:    --  1m  1m  5m   5m   5/15m  1H  4H
+//   HTF:    15m 30m 1H  4H   4H   1D     1W  1M
+mtf_ladder(int sec, string ltf1h) =>
+    string l = ""
+    string h = ""
+    if sec < 180
+        l := ""
+        h := "15"
+    else if sec < 300
+        l := "1"
+        h := "30"
+    else if sec < 900
+        l := "1"
+        h := "60"
+    else if sec < 1800
+        l := "5"
+        h := "240"
+    else if sec < 3600
+        l := "5"
+        h := "240"
+    else if sec < 14400
+        l := ltf1h
+        h := "D"
+    else if sec < 86400
+        l := "60"
+        h := "W"
+    else
+        l := "240"
+        h := "M"
+    [l, h]
+
+// Short display name for a timeframe string, e.g. "60" -> "1H", "240" -> "4H", "D" -> "1D".
+mtf_tfName(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s < 3600 ? str.tostring(math.round(s / 60)) + "m" : s < 86400 ? str.tostring(math.round(s / 3600)) + "H" : s < 604800 ? str.tostring(math.round(s / 86400)) + "D" : s < 2419200 ? str.tostring(math.round(s / 604800)) + "W" : str.tostring(math.round(s / 2628000)) + "M"
+
+int  mtfChartSec  = timeframe.in_seconds(timeframe.period)
+// MTF needs a standard, time-based chart: on Renko/Range/Kagi/P&F/Line Break/Heikin Ashi or tick
+// charts, OHLC is synthetic or bars aren't time-sliced, so cross-timeframe zones would be wrong.
+bool mtfSupported = chart.is_standard and not timeframe.isticks
+[mtfAutoL, mtfAutoH] = mtf_ladder(mtfChartSec, mtfLtf1h)
+string mtfHtfRaw = mtfMode == "Auto" ? mtfAutoH : mtfHtfMan
+string mtfLtfRaw = mtfMode == "Auto" ? mtfAutoL : mtfLtfMan
+// A layer is enabled only when it is strictly higher (HTF) / lower (LTF) than the chart.
+// A manual setting on the wrong side is disabled with a warning -- never silently swapped.
+bool mtfHtfOn = mtfSupported and mtfHtfRaw != "" and timeframe.in_seconds(mtfHtfRaw) > mtfChartSec
+bool mtfLtfOn = mtfSupported and mtfLtfRaw != "" and timeframe.in_seconds(mtfLtfRaw) < mtfChartSec
+string mtfWarn = not mtfSupported ? "MTF off: needs a standard time-based chart" : mtfHtfRaw != "" and not mtfHtfOn ? "HTF " + mtfHtfRaw + " is not above chart TF -- HTF layer off" : mtfLtfRaw != "" and not mtfLtfOn ? "LTF " + mtfLtfRaw + " is not below chart TF -- LTF layer off" : ""
+// Requests always get a valid timeframe: a disabled layer requests the chart TF and is ignored.
+string mtfHtfSafe = mtfHtfOn ? mtfHtfRaw : timeframe.period
+string mtfLtfSafe = mtfLtfOn ? mtfLtfRaw : timeframe.period
+string mtfHtfName = mtfHtfOn ? mtf_tfName(mtfHtfRaw) : "off"
+string mtfLtfName = mtfLtfOn ? mtf_tfName(mtfLtfRaw) : "off"
+string mtfCtfName = mtf_tfName(timeframe.period)
+
+// ============================= MTF ENGINE: ZONE DEFINITIONS =============================
+// These decide WHAT a zone is. They are frozen across every backtest model (A-F); models only
+// decide which setups get taken. Changing one of these = a new experiment, not a new model.
+float mtfFvgMinAtr  = input.float(0.10, "FVG: minimum gap size (x ATR14)", minval = 0.0, step = 0.05, group = "MTF Zone Definitions")
+bool  mtfFvgNeedDsp = input.bool(true, "FVG: middle candle must be a displacement candle", group = "MTF Zone Definitions")
+float mtfDispAtr    = input.float(1.2, "Displacement: candle body >= x ATR14 (ATR measured before that candle)", minval = 0.1, step = 0.1, group = "MTF Zone Definitions")
+int   mtfObBosBars  = input.int(5, "OB: BOS must follow the displacement within (bars)", minval = 0, maxval = 50, group = "MTF Zone Definitions")
+int   mtfPivLen     = input.int(5, "Swing: pivot strength (bars each side)", minval = 1, maxval = 50, tooltip = "A swing is only KNOWN this many bars after it prints. It is drawn at the pivot bar, but every rule uses the confirmation bar.", group = "MTF Zone Definitions")
+
+// ============================= MTF ENGINE: EVENT DETECTOR =============================
+// Runs in whatever timeframe context it is called from (chart, HTF via request.security, LTF via
+// request.security_lower_tf) and returns only the events that became KNOWN on that bar's close.
+// It draws nothing. Each call site keeps its own `var` state.
+//   FVG (bull):  low > high[2], gap >= mtfFvgMinAtr*ATR, optional displacement middle candle.
+//                Zone = [high[2], low]. Origin (visual) = candle 1 time.
+//   OB  (bull):  last down-close candle before a displacement up-candle, kept as a candidate
+//                for mtfObBosBars bars; it becomes an OB only when a BOS (close above the last
+//                confirmed swing high) happens in that window. Zone = that candle's [low, high].
+//   Swing H/L:   ta.pivothigh/low(len, len); value returned on the CONFIRMATION bar, with the
+//                pivot bar's time for drawing.
+//   Structure:   trend = +1 after a close above the last unbroken confirmed swing high, -1 after a
+//                close below the last unbroken confirmed swing low (BOS/CHoCH state).
+//   Range:       last confirmed swing high / low (never consumed) = dealing range for P/D, OTE.
+mtf_events(simple float dispAtr, simple float fvgMinAtr, simple bool fvgNeedDsp, simple int obBosBars, simple int pivLen) =>
+    float atr  = ta.atr(14)
+    float vSma = ta.sma(volume, 20)
+    float atrPrev  = nz(atr[1], atr)
+    float atrPrev2 = nz(atr[2], atrPrev)
+    // --- FVG ---
+    bool  midDisp = math.abs(close[1] - open[1]) >= dispAtr * atrPrev2
+    bool  bullF = low > high[2] and (low - high[2]) >= fvgMinAtr * atr and (not fvgNeedDsp or (midDisp and close[1] > open[1]))
+    bool  bearF = high < low[2] and (low[2] - high) >= fvgMinAtr * atr and (not fvgNeedDsp or (midDisp and close[1] < open[1]))
+    float bFT = bullF ? low : na
+    float bFB = bullF ? high[2] : na
+    float sFT = bearF ? low[2] : na
+    float sFB = bearF ? high : na
+    int   fT  = time[2]
+    // --- Swings + structure ---
+    float ph = ta.pivothigh(pivLen, pivLen)
+    float pl = ta.pivotlow(pivLen, pivLen)
+    int   pT = time[pivLen]
+    var float swHi  = na
+    var float swLo  = na
+    var float rgHi  = na
+    var float rgLo  = na
+    var int   trend = 0
+    if not na(ph)
+        swHi := ph
+        rgHi := ph
+    if not na(pl)
+        swLo := pl
+        rgLo := pl
+    bool bosUp = not na(swHi) and close > swHi
+    bool bosDn = not na(swLo) and close < swLo
+    if bosUp
+        trend := 1
+        swHi  := na
+    if bosDn
+        trend := -1
+        swLo  := na
+    // --- Order blocks ---
+    var float lastDnH = na
+    var float lastDnL = na
+    var int   lastDnT = na
+    var float lastDnV = na
+    var float lastUpH = na
+    var float lastUpL = na
+    var int   lastUpT = na
+    var float lastUpV = na
+    var float cbH = na
+    var float cbL = na
+    var int   cbT = na
+    var float cbV = na
+    var int   cbAge = na
+    var float csH = na
+    var float csL = na
+    var int   csT = na
+    var float csV = na
+    var int   csAge = na
+    bool dispUp = close > open and (close - open) >= dispAtr * atrPrev
+    bool dispDn = close < open and (open - close) >= dispAtr * atrPrev
+    if not na(cbAge)
+        cbAge += 1
+        if cbAge > obBosBars
+            cbAge := na
+    if not na(csAge)
+        csAge += 1
+        if csAge > obBosBars
+            csAge := na
+    if dispUp and not na(lastDnH)
+        cbH := lastDnH
+        cbL := lastDnL
+        cbT := lastDnT
+        cbV := lastDnV
+        cbAge := 0
+    if dispDn and not na(lastUpH)
+        csH := lastUpH
+        csL := lastUpL
+        csT := lastUpT
+        csV := lastUpV
+        csAge := 0
+    float bOT = na
+    float bOB = na
+    float bOV = na
+    int   bOTm = na
+    float sOT = na
+    float sOB = na
+    float sOV = na
+    int   sOTm = na
+    if bosUp and not na(cbAge)
+        bOT  := cbH
+        bOB  := cbL
+        bOV  := cbV
+        bOTm := cbT
+        cbAge := na
+    if bosDn and not na(csAge)
+        sOT  := csH
+        sOB  := csL
+        sOV  := csV
+        sOTm := csT
+        csAge := na
+    // The current candle becomes the "last opposite candle" only after it has been used above.
+    if close < open
+        lastDnH := high
+        lastDnL := low
+        lastDnT := time
+        lastDnV := vSma > 0 ? volume / vSma : na
+    if close > open
+        lastUpH := high
+        lastUpL := low
+        lastUpT := time
+        lastUpV := vSma > 0 ? volume / vSma : na
+    [bFT, bFB, sFT, sFB, fT, bOT, bOB, bOV, bOTm, sOT, sOB, sOV, sOTm, ph, pl, pT, trend, rgHi, rgLo, time]
+
+// Confirmed-only wrapper for HTF requests: every element is offset by one bar INSIDE the
+// requested context (a tuple can't be history-indexed from outside). Used with
+// lookahead_on, this returns the last CLOSED HTF bar's events on every chart bar -- the
+// TradingView-documented non-repainting pattern.
+mtf_eventsConfirmed(simple float dispAtr, simple float fvgMinAtr, simple bool fvgNeedDsp, simple int obBosBars, simple int pivLen) =>
+    [a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20] = mtf_events(dispAtr, fvgMinAtr, fvgNeedDsp, obBosBars, pivLen)
+    [a1[1], a2[1], a3[1], a4[1], a5[1], a6[1], a7[1], a8[1], a9[1], a10[1], a11[1], a12[1], a13[1], a14[1], a15[1], a16[1], a17[1], a18[1], a19[1], a20[1]]
+
+// ============================= MTF ENGINE: DATA REQUESTS =============================
+// Chart TF: direct call.
+[cBFT, cBFB, cSFT, cSFB, cFT, cBOT, cBOB, cBOV, cBOTm, cSOT, cSOB, cSOV, cSOTm, cPH, cPL, cPT, cTrend, cRgHi, cRgLo, cTm] = mtf_events(mtfDispAtr, mtfFvgMinAtr, mtfFvgNeedDsp, mtfObBosBars, mtfPivLen)
+// HTF, confirmed: one request; values change once per closed HTF bar.
+[hBFT, hBFB, hSFT, hSFB, hFT, hBOT, hBOB, hBOV, hBOTm, hSOT, hSOB, hSOV, hSOTm, hPH, hPL, hPT, hTrendRaw, hRgHiRaw, hRgLoRaw, hTm] = request.security(syminfo.tickerid, mtfHtfSafe, mtf_eventsConfirmed(mtfDispAtr, mtfFvgMinAtr, mtfFvgNeedDsp, mtfObBosBars, mtfPivLen), lookahead = barmerge.lookahead_on)
+// HTF, developing (display only): the still-forming HTF bar. Never used by setups.
+[dBFT, dBFB, dSFT, dSFB, dFT, dBOT, dBOB, dBOV, dBOTm, dSOT, dSOB, dSOV, dSOTm, dPH, dPL, dPT, dTrend, dRgHi, dRgLo, dTm] = request.security(syminfo.tickerid, mtfHtfSafe, mtf_events(mtfDispAtr, mtfFvgMinAtr, mtfFvgNeedDsp, mtfObBosBars, mtfPivLen), lookahead = barmerge.lookahead_off)
+// LTF: one request; each element is an array with one value per intrabar.
+[lBFT, lBFB, lSFT, lSFB, lFT, lBOT, lBOB, lBOV, lBOTm, lSOT, lSOB, lSOV, lSOTm, lPH, lPL, lPT, lTrend, lRgHi, lRgLo, lTm] = request.security_lower_tf(syminfo.tickerid, mtfLtfSafe, mtf_events(mtfDispAtr, mtfFvgMinAtr, mtfFvgNeedDsp, mtfObBosBars, mtfPivLen))
+
+int   mtfHtfTrend = mtfHtfOn ? hTrendRaw : 0
+float mtfRgHi     = mtfHtfOn ? hRgHiRaw : na
+float mtfRgLo     = mtfHtfOn ? hRgLoRaw : na
+int   mtfLtfTrend = mtfLtfOn and array.size(lTrend) > 0 ? array.last(lTrend) : 0
+
+// HTF dedup: the confirmed tuple repeats on every chart bar inside one HTF bar; only the first
+// chart bar after an HTF close (new hTm) processes it.
+var int mtfLastHtfT = na
+bool mtfHtfNew = mtfHtfOn and not na(hTm) and hTm != mtfLastHtfT
+// LTF bookkeeping: intrabars are processed strictly in time order and never twice.
+var int mtfLastLtfT = 0
+var int mtfLtfMissing = 0
+
+// ==== ENGINE END (keep in sync) ====
+
+mtf_trendTxt(int t) =>
+    t == 1 ? "Up" : t == -1 ? "Down" : "n/a"
+
 // ============================= DASHBOARD TABLE =============================
-var table dash = table.new(position.top_right, 2, 11, border_width = 1, bgcolor = color.new(color.black, 20))
+var table dash = table.new(position.top_right, 2, 24, border_width = 1, bgcolor = color.new(color.black, 20))
 
 if barstate.islast
     table.cell(dash, 0, 0, "COT Net", text_color = color.white)
@@ -717,3 +965,18 @@ if barstate.islast
 
     table.cell(dash, 0, 10, "Last CISD", text_color = color.white)
     table.cell(dash, 1, 10, cisdLastOut, text_color = cisdLastOut == "Bullish" ? color.aqua : cisdLastOut == "Bearish" ? color.maroon : color.gray)
+
+    // ---- MTF engine rows ----
+    table.cell(dash, 0, 11, "TF  LTF / Chart / HTF", text_color = color.white)
+    table.cell(dash, 1, 11, mtfLtfName + " / " + mtfCtfName + " / " + mtfHtfName, text_color = color.gray)
+
+    table.cell(dash, 0, 12, "Trend  LTF / Chart / HTF", text_color = color.white)
+    table.cell(dash, 1, 12, mtf_trendTxt(mtfLtfTrend) + " / " + mtf_trendTxt(cTrend) + " / " + mtf_trendTxt(mtfHtfTrend), text_color = color.gray)
+
+    string alignTxt = mtfHtfTrend == 1 and cTrend == 1 and (not mtfLtfOn or mtfLtfTrend == 1) ? "Aligned Bull" : mtfHtfTrend == -1 and cTrend == -1 and (not mtfLtfOn or mtfLtfTrend == -1) ? "Aligned Bear" : "Mixed"
+    table.cell(dash, 0, 13, "Alignment", text_color = color.white)
+    table.cell(dash, 1, 13, alignTxt, text_color = alignTxt == "Aligned Bull" ? color.teal : alignTxt == "Aligned Bear" ? color.maroon : color.gray)
+
+    if mtfWarn != ""
+        table.cell(dash, 0, 23, "Warning", text_color = color.yellow)
+        table.cell(dash, 1, 23, mtfWarn, text_color = color.yellow)
