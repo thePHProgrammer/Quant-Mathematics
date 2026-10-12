@@ -1,0 +1,719 @@
+//@version=6
+indicator("Trading Context Pack (COT + Volume Profile + Delta)", overlay = true, max_boxes_count = 500, max_labels_count = 200, max_lines_count = 100)
+
+// ============================================================================
+// ONE indicator slot, no Premium/Ultimate required. Combines three things:
+//   1. Weekly COT positioning (large speculators) -- futures symbols only.
+//   2. A fixed-lookback Volume Profile histogram (POC / Value Area), built from
+//      each bar's own high/low/volume, since real footprint data needs Premium/Ultimate.
+//   3. An approximate cumulative delta from lower-timeframe volume.
+// Results show as a small table (top-right), a histogram bar per price bin on the
+// left of the profile window, and full-width highlighted POC/VAH/VAL bands --
+// similar in spirit to public tools like ChartPrime's Filtered Volume Profile,
+// built independently here since that one's a separate paid script, not something
+// to copy.
+//
+// HONESTY NOTE: I have no way to compile-test Pine Script myself. Built carefully
+// from documented Pine features, but if the Editor throws a compile error, paste
+// it back with the line number and I'll fix that specific line.
+// ============================================================================
+
+import TradingView/LibraryCOT/6 as cot
+
+// ============================= INPUTS =============================
+// -- COT --
+bool   enableCOT      = input.bool(true, "COT: enable (turn OFF on spot/CFD symbols like XAUUSD, EURUSD)", group = "COT")
+string cftcOverride   = input.string("", "COT: manual CFTC code (blank = auto)", group = "COT")
+string reportType     = input.string("Legacy", "COT: report type", options = ["Legacy", "Disaggregated", "Financial"], group = "COT")
+bool   includeOptions = input.bool(false, "COT: include options data", group = "COT")
+string longMetric     = input.string("Noncommercial Positions", "COT: metric name", tooltip = "Confirmed against TradingView's own COT indicator docs. 'Noncommercial Positions' = large speculators' actual position size in contracts. Swap to 'Commercial Positions' to track hedgers instead.", group = "COT")
+int    cotLookback    = input.int(156, "COT: extremes lookback (bars)", minval = 20, tooltip = "156 weekly bars ~= 3 years, used to flag positioning extremes.", group = "COT")
+
+// -- Volume Profile (fixed-lookback histogram) --
+bool   showVP           = input.bool(true, "Volume Profile: show", group = "Volume Profile")
+int    profileLookback  = input.int(200, "Volume Profile: lookback (bars)", minval = 20, maxval = 2000, tooltip = "How many recent bars the profile is built from -- a rolling window, not a session reset. Large values may slow the chart down.", group = "Volume Profile")
+int    profileWidthBars = input.int(30, "Volume Profile: max bar width (bars)", minval = 5, maxval = 200, tooltip = "How wide the single biggest bin's bar is drawn, in bars. Other bins scale relative to it.", group = "Volume Profile")
+bool   autoBinSize     = input.bool(true, "Volume Profile: auto-size bins to instrument", tooltip = "Sizes bins from this instrument's own daily ATR, so you don't have to manually re-tune this every time you switch symbols (EURUSD vs XAUUSD vs an index). Turn off to set a fixed bin size yourself.", group = "Volume Profile")
+int    autoBinRows     = input.int(40, "Volume Profile: auto bin target rows", minval = 10, maxval = 200, tooltip = "Roughly how many bins to divide the lookback range into. More rows = finer profile, fewer = coarser. Only used when auto-size is on.", group = "Volume Profile")
+float  manualRowSize   = input.float(0.0005, "Volume Profile: manual bin size (price units)", minval = 0.00001, step = 0.0001, tooltip = "Only used when auto-size is off, e.g. 0.0005 for EURUSD, 5-10 for gold/indices.", group = "Volume Profile")
+int    vaPercent       = input.int(70, "Volume Profile: Value Area %", minval = 1, maxval = 99, group = "Volume Profile")
+
+// -- Delta (approximation) --
+string lowerTfDelta      = input.timeframe("1", "Delta: lower timeframe", group = "Delta")
+bool   resetSessionDelta = input.bool(true, "Delta: reset cumulative each session", group = "Delta")
+
+// -- FVG (Fair Value Gap) --
+bool  showFVG      = input.bool(true, "FVG: show", group = "FVG")
+int   fvgBoxWidth  = input.int(10, "FVG: box width (bars)", minval = 1, maxval = 200, tooltip = "Fixed width for each gap box, like a standard FVG indicator -- it does not keep stretching forward until filled.", group = "FVG")
+int   maxFVGBoxes  = input.int(20, "FVG: max active gaps shown per side", minval = 1, maxval = 100, tooltip = "Oldest unfilled gap is dropped once this is exceeded.", group = "FVG")
+color fvgColor     = input.color(color.new(color.red, 70), "FVG: color", group = "FVG")
+
+// -- Supply/Demand (swing-based) --
+bool showSD     = input.bool(true, "Supply/Demand: show", group = "Supply/Demand")
+int  pivotLen   = input.int(5, "Supply/Demand: pivot strength (bars each side)", minval = 1, maxval = 50, tooltip = "Higher = fewer, more significant swing points. A pivot only confirms this many bars after it happens (normal lag for any swing detector).", group = "Supply/Demand")
+int  maxSDZones = input.int(10, "Supply/Demand: max zones per side", minval = 1, maxval = 50, group = "Supply/Demand")
+
+// -- Order Block --
+bool  showOB           = input.bool(true, "Order Block: show", group = "Order Block")
+int   obBoxWidth       = input.int(15, "Order Block: box width (bars)", minval = 1, maxval = 200, tooltip = "Fixed width, same idea as FVG width -- doesn't stretch forward until mitigated.", group = "Order Block")
+float obImpulseAtrMult = input.float(1.5, "Order Block: impulse strength (x ATR)", minval = 0.5, step = 0.1, tooltip = "How much bigger than a typical recent candle the breakout candle must be to count as impulsive.", group = "Order Block")
+int   maxOBBoxes       = input.int(15, "Order Block: max active blocks per side", minval = 1, maxval = 50, group = "Order Block")
+color obColor          = input.color(color.new(color.orange, 75), "Order Block: color", group = "Order Block")
+
+// -- Market Structure (BOS/CHoCH) --
+bool  showMS        = input.bool(true, "Market Structure: show", group = "Market Structure")
+int   msPivotLen    = input.int(5, "Market Structure: pivot strength (bars each side)", minval = 1, maxval = 50, group = "Market Structure")
+int   maxMSMarkers  = input.int(30, "Market Structure: max markers shown", minval = 1, maxval = 100, tooltip = "Oldest BOS/CHoCH marker is dropped once this is exceeded.", group = "Market Structure")
+color bosColor      = input.color(color.new(color.gray, 30), "Market Structure: BOS color", group = "Market Structure")
+color chochColor    = input.color(color.new(color.orange, 20), "Market Structure: CHoCH color", group = "Market Structure")
+
+// -- Kill Zones --
+bool   showKZ         = input.bool(true, "Kill Zones: show", group = "Kill Zones")
+string londonKZSession = input.session("0200-0500", "London Kill Zone (EST)", group = "Kill Zones")
+string nyAmKZSession   = input.session("0830-1100", "NY AM Kill Zone (EST)", group = "Kill Zones")
+string nyPmKZSession   = input.session("1330-1600", "NY PM Kill Zone (EST)", group = "Kill Zones")
+
+// -- SMT Divergence --
+bool   showSMT      = input.bool(true, "SMT: show", group = "SMT")
+string smtSymbol    = input.symbol("", "SMT: correlated symbol (blank = off)", tooltip = "e.g. FX:GBPUSD if charting EURUSD, or CME_MINI:NQ1! if charting CME_MINI:ES1!. Needs a genuinely correlated instrument on the same timeframe -- leave blank to disable.", group = "SMT")
+int    smtPivotLen  = input.int(5, "SMT: pivot strength (bars each side)", minval = 1, maxval = 50, group = "SMT")
+int    maxSMTLabels = input.int(20, "SMT: max markers shown", minval = 1, maxval = 100, group = "SMT")
+
+// -- CISD (Change in State of Delivery) --
+// Body-close test, distinct from the swing-based CHoCH above: the level is the OPEN of the
+// first candle in the most recent run of same-direction candles, and it confirms on a full
+// BODY close through that level (a wick alone doesn't count) -- so CISD typically fires
+// earlier than a CHoCH, and more often, since it doesn't wait for an actual swing break.
+bool  showCISD       = input.bool(true, "CISD: show", group = "CISD")
+int   maxCISDMarkers = input.int(20, "CISD: max markers shown", minval = 1, maxval = 100, group = "CISD")
+color cisdBullColor  = input.color(color.new(color.aqua, 20), "CISD: bullish color", group = "CISD")
+color cisdBearColor  = input.color(color.new(color.maroon, 20), "CISD: bearish color", group = "CISD")
+
+// -- Low Resistance Liquidity (approximate score) --
+// HONEST CAVEAT: this is NOT a mechanical ICT definition -- there isn't one. It's a proxy:
+// counting how many of your own currently-active Supply/Demand zones (from the section
+// below) sit between current price and each direction. Fewer zones in the way = "low
+// resistance" reading; more = "high resistance." Treat it as a rough filter, not a signal.
+bool showLRL = input.bool(true, "Low Resistance Liquidity: show (approx.)", group = "Low Resistance Liquidity")
+
+// ============================= COT =============================
+// Futures symbols only (e.g. CME_MINI:6E1!, CME:6B1!, COMEX:GC1! for gold futures).
+// getCFTCCode() RAISES A RUNTIME ERROR -- which halts the entire script, every section,
+// not just this one -- if the chart symbol isn't a recognized futures instrument. Spot/CFD
+// symbols like XAUUSD or EURUSD will trip that, so it's gated behind "COT: enable":
+// leave it OFF on a spot/CFD chart, turn it ON only when charting the actual futures
+// contract (e.g. switch XAUUSD to COMEX:GC1! or COMEX_MINI:MGC1! to get gold's COT data).
+float cotNet   = na
+float cotIndex = na
+if enableCOT
+    string cftcCode = cftcOverride != "" ? cftcOverride : cot.getCFTCCode(syminfo.tickerid)
+    float specLong  = cot.requestCommitmentOfTraders(reportType, cftcCode, includeOptions, longMetric, "Long", "All")
+    float specShort = cot.requestCommitmentOfTraders(reportType, cftcCode, includeOptions, longMetric, "Short", "All")
+    cotNet := specLong - specShort
+    float cotHi = ta.highest(cotNet, cotLookback)
+    float cotLo = ta.lowest(cotNet, cotLookback)
+    cotIndex := cotHi != cotLo ? (cotNet - cotLo) / (cotHi - cotLo) * 100 : na
+
+// ============================= VOLUME PROFILE (fixed-lookback histogram) =============================
+// Distributes each bar's volume across every price bin its high-to-low range spans
+// (not just its close), then redraws the whole histogram fresh on the last bar only --
+// old boxes/labels are deleted first so they don't pile up past Pine's drawing limits.
+float dailyATR         = request.security(syminfo.tickerid, "D", ta.atr(14))
+float effectiveRowSize = autoBinSize ? math.max(dailyATR / autoBinRows, syminfo.mintick * 2) : manualRowSize
+
+var array<box> vpBoxes = array.new_box()
+var box   pocBand  = na
+var box   vahBand  = na
+var box   valBand  = na
+var label pocLabel = na
+var label vahLabel = na
+var label valLabel = na
+
+var float pocPriceOut = na
+var float vahPriceOut = na
+var float valPriceOut = na
+var float pocVolOut   = na
+
+if barstate.islast
+    for b in vpBoxes
+        box.delete(b)
+    array.clear(vpBoxes)
+    if not na(pocBand)
+        box.delete(pocBand)
+        pocBand := na
+    if not na(vahBand)
+        box.delete(vahBand)
+        vahBand := na
+    if not na(valBand)
+        box.delete(valBand)
+        valBand := na
+    if not na(pocLabel)
+        label.delete(pocLabel)
+        pocLabel := na
+    if not na(vahLabel)
+        label.delete(vahLabel)
+        vahLabel := na
+    if not na(valLabel)
+        label.delete(valLabel)
+        valLabel := na
+
+    if not showVP
+        pocPriceOut := na
+        vahPriceOut := na
+        valPriceOut := na
+        pocVolOut   := na
+
+    if showVP
+        map<int, float> hist = map.new<int, float>()
+        int lastIdx = math.min(profileLookback - 1, bar_index)
+        for i = 0 to lastIdx
+            float hi  = high[i]
+            float lo  = low[i]
+            float vol = volume[i]
+            int kHi = int(math.round(hi / effectiveRowSize))
+            int kLo = int(math.round(lo / effectiveRowSize))
+            int span = kHi - kLo + 1
+            float volPerBin = vol / span
+            for k = kLo to kHi
+                float existing = map.contains(hist, k) ? map.get(hist, k) : 0.0
+                map.put(hist, k, existing + volPerBin)
+
+        if map.size(hist) > 0
+            array<int>   hKeys = map.keys(hist)
+            array<float> hVals = map.values(hist)
+            int hn = array.size(hKeys)
+
+            // Point of Control: the single bin with the most volume.
+            float maxVol = -1.0
+            int   pocKey = na
+            for i = 0 to hn - 1
+                float v = array.get(hVals, i)
+                if v > maxVol
+                    maxVol := v
+                    pocKey := array.get(hKeys, i)
+
+            // Value Area: expand outward from the POC, one bin at a time, always taking
+            // whichever adjacent side has more volume, until vaPercent of total volume
+            // is covered.
+            float totalVol = array.sum(hVals)
+            float target   = totalVol * (vaPercent / 100.0)
+            int   vaHiKey  = pocKey
+            int   vaLoKey  = pocKey
+            float accumulated = maxVol
+            bool  canExpand   = true
+            while accumulated < target and canExpand
+                int  upKey = vaHiKey + 1
+                int  dnKey = vaLoKey - 1
+                bool hasUp = map.contains(hist, upKey)
+                bool hasDn = map.contains(hist, dnKey)
+                if not hasUp and not hasDn
+                    canExpand := false
+                else
+                    float upVol = hasUp ? map.get(hist, upKey) : -1.0
+                    float dnVol = hasDn ? map.get(hist, dnKey) : -1.0
+                    if upVol >= dnVol
+                        vaHiKey := upKey
+                        accumulated += upVol
+                    else
+                        vaLoKey := dnKey
+                        accumulated += dnVol
+
+            int leftAnchor = bar_index - lastIdx
+
+            // Draw the histogram: one box per bin, width proportional to that bin's volume.
+            for i = 0 to hn - 1
+                int   k = array.get(hKeys, i)
+                float v = array.get(hVals, i)
+                float widthBars = math.max((v / maxVol) * profileWidthBars, 1)
+                bool  inVA  = k >= vaLoKey and k <= vaHiKey
+                bool  isPoc = k == pocKey
+                color boxColor = isPoc ? color.new(color.orange, 20) : inVA ? color.new(color.blue, 55) : color.new(color.gray, 80)
+                box newBox = box.new(left = leftAnchor, top = (k + 0.5) * effectiveRowSize, right = leftAnchor + int(math.round(widthBars)), bottom = (k - 0.5) * effectiveRowSize, bgcolor = boxColor, border_width = 0)
+                array.push(vpBoxes, newBox)
+
+            // Full-width highlighted bands for POC / VAH / VAL, like support-resistance zones.
+            float pocTop = (pocKey + 0.5) * effectiveRowSize
+            float pocBot = (pocKey - 0.5) * effectiveRowSize
+            pocBand  := box.new(left = leftAnchor, top = pocTop, right = bar_index + 500, bottom = pocBot, bgcolor = color.new(color.orange, 75), border_width = 0)
+            pocLabel := label.new(bar_index, pocTop, "POC  " + str.tostring(maxVol, format.volume), style = label.style_label_left, color = color.orange, textcolor = color.white, size = size.small)
+
+            float vahTop = (vaHiKey + 0.5) * effectiveRowSize
+            float vahBot = (vaHiKey - 0.5) * effectiveRowSize
+            vahBand  := box.new(left = leftAnchor, top = vahTop, right = bar_index + 500, bottom = vahBot, bgcolor = color.new(color.blue, 80), border_width = 0)
+            vahLabel := label.new(bar_index, vahTop, "VAH", style = label.style_label_left, color = color.blue, textcolor = color.white, size = size.small)
+
+            float valTop = (vaLoKey + 0.5) * effectiveRowSize
+            float valBot = (vaLoKey - 0.5) * effectiveRowSize
+            valBand  := box.new(left = leftAnchor, top = valTop, right = bar_index + 500, bottom = valBot, bgcolor = color.new(color.purple, 80), border_width = 0)
+            valLabel := label.new(bar_index, valTop, "VAL", style = label.style_label_left, color = color.purple, textcolor = color.white, size = size.small)
+
+            pocPriceOut := (pocTop + pocBot) / 2
+            vahPriceOut := vahTop
+            valPriceOut := valBot
+            pocVolOut   := maxVol
+
+// ============================= MARKET STRUCTURE (BOS/CHoCH) =============================
+// Tracks the most recent confirmed swing high/low and labels each break: breaking in the
+// direction of the current trend = BOS (continuation), breaking AGAINST it = CHoCH
+// (reversal, flips the tracked trend). Distinct from your CISD -- this is the formal
+// swing-break vocabulary most other ICT tools expect. Runs every bar (not just the last)
+// so it displays correctly through history. Capped and shifted like FVG/OB above.
+float msPH = ta.pivothigh(msPivotLen, msPivotLen)
+float msPL = ta.pivotlow(msPivotLen, msPivotLen)
+
+var float msSwingHigh    = na
+var float msSwingLow     = na
+var int   msSwingHighBar = na
+var int   msSwingLowBar  = na
+var int   msTrend        = 0  // 1 = up, -1 = down, 0 = undefined (no break yet)
+
+var array<line>  msLines  = array.new_line()
+var array<label> msLabels = array.new_label()
+
+if showMS
+    if not na(msPH)
+        msSwingHigh    := msPH
+        msSwingHighBar := bar_index - msPivotLen
+    if not na(msPL)
+        msSwingLow    := msPL
+        msSwingLowBar := bar_index - msPivotLen
+
+    if not na(msSwingHigh) and close > msSwingHigh
+        string tag = msTrend == -1 ? "CHoCH" : "BOS"
+        color  col = msTrend == -1 ? chochColor : bosColor
+        line  newLine  = line.new(msSwingHighBar, msSwingHigh, bar_index, msSwingHigh, color = col, width = 2)
+        label newLabel = label.new(bar_index, msSwingHigh, tag, style = label.style_label_down, color = col, textcolor = color.white, size = size.small)
+        array.push(msLines, newLine)
+        array.push(msLabels, newLabel)
+        if array.size(msLines) > maxMSMarkers
+            line.delete(array.shift(msLines))
+            label.delete(array.shift(msLabels))
+        msTrend     := 1
+        msSwingHigh := na
+
+    if not na(msSwingLow) and close < msSwingLow
+        string tag = msTrend == 1 ? "CHoCH" : "BOS"
+        color  col = msTrend == 1 ? chochColor : bosColor
+        line  newLine  = line.new(msSwingLowBar, msSwingLow, bar_index, msSwingLow, color = col, width = 2)
+        label newLabel = label.new(bar_index, msSwingLow, tag, style = label.style_label_up, color = col, textcolor = color.white, size = size.small)
+        array.push(msLines, newLine)
+        array.push(msLabels, newLabel)
+        if array.size(msLines) > maxMSMarkers
+            line.delete(array.shift(msLines))
+            label.delete(array.shift(msLabels))
+        msTrend    := -1
+        msSwingLow := na
+
+// ============================= KILL ZONES =============================
+// Session-time highlighting only -- no drawing objects, just a background tint, so this
+// adds no clutter risk regardless of how long the chart history is.
+bool inLondonKZ = not na(time(timeframe.period, londonKZSession + ":1234567", "America/New_York"))
+bool inNyAmKZ   = not na(time(timeframe.period, nyAmKZSession + ":1234567", "America/New_York"))
+bool inNyPmKZ   = not na(time(timeframe.period, nyPmKZSession + ":1234567", "America/New_York"))
+color kzColor   = inLondonKZ ? color.new(color.blue, 92) : inNyAmKZ ? color.new(color.orange, 92) : inNyPmKZ ? color.new(color.purple, 92) : na
+bgcolor(showKZ ? kzColor : na, title = "Kill Zone highlight")
+
+// ============================= SMT DIVERGENCE =============================
+// Compares swing points on THIS chart against a correlated symbol you provide. A bearish
+// SMT prints when this chart makes a higher high but the correlated symbol fails to; a
+// bullish SMT is the mirror at swing lows. HONEST CAVEAT: this isn't a standalone signal
+// even in ICT's own teaching -- it's meant to be read as confluence at a level you already
+// care about, and it's only meaningful while the two symbols are actually correlated,
+// which drifts over time. Requires a symbol in "SMT: correlated symbol" to do anything.
+float smtPH = ta.pivothigh(smtPivotLen, smtPivotLen)
+float smtPL = ta.pivotlow(smtPivotLen, smtPivotLen)
+// Always call request.security() with a guaranteed-valid symbol -- falls back to this
+// chart's own symbol when blank (a harmless self-comparison that never flags a divergence)
+// rather than conditionally calling request.security() itself, which risks erroring on an
+// empty string if Pine evaluates both sides of the ternary below it.
+string smtSymbolSafe = smtSymbol != "" ? smtSymbol : syminfo.tickerid
+[corPH, corPL] = request.security(smtSymbolSafe, timeframe.period, [ta.pivothigh(smtPivotLen, smtPivotLen), ta.pivotlow(smtPivotLen, smtPivotLen)])
+
+var float myHighPrev  = na
+var float myHighCurr  = na
+var float corHighPrev = na
+var float corHighCurr = na
+var float myLowPrev   = na
+var float myLowCurr   = na
+var float corLowPrev  = na
+var float corLowCurr  = na
+
+var array<label> smtLabels = array.new_label()
+
+if not na(smtPH)
+    myHighPrev := myHighCurr
+    myHighCurr := smtPH
+if not na(corPH)
+    corHighPrev := corHighCurr
+    corHighCurr := corPH
+if not na(smtPL)
+    myLowPrev := myLowCurr
+    myLowCurr := smtPL
+if not na(corPL)
+    corLowPrev := corLowCurr
+    corLowCurr := corPL
+
+if showSMT and smtSymbol != ""
+    if not na(smtPH) and not na(myHighPrev) and not na(corHighCurr) and not na(corHighPrev)
+        if myHighCurr > myHighPrev and corHighCurr < corHighPrev
+            label newLabel = label.new(bar_index - smtPivotLen, myHighCurr, "SMT-", style = label.style_label_down, color = color.new(color.red, 20), textcolor = color.white, size = size.small)
+            array.push(smtLabels, newLabel)
+            if array.size(smtLabels) > maxSMTLabels
+                label.delete(array.shift(smtLabels))
+
+    if not na(smtPL) and not na(myLowPrev) and not na(corLowCurr) and not na(corLowPrev)
+        if myLowCurr < myLowPrev and corLowCurr > corLowPrev
+            label newLabel = label.new(bar_index - smtPivotLen, myLowCurr, "SMT+", style = label.style_label_up, color = color.new(color.green, 20), textcolor = color.white, size = size.small)
+            array.push(smtLabels, newLabel)
+            if array.size(smtLabels) > maxSMTLabels
+                label.delete(array.shift(smtLabels))
+
+// ============================= CISD (Change in State of Delivery) =============================
+// Tracks runs of consecutive same-direction (body) candles. When a NEW run starts, its
+// first candle's OPEN becomes a pending level for the opposite direction: the open of a
+// fresh down-run is watched for a bullish CISD (body close back above it); the open of a
+// fresh up-run is watched for a bearish CISD (body close back below it). Confirms once,
+// then the level is consumed -- it doesn't keep re-triggering while price stays beyond it.
+var float cisdDownLegOpen    = na
+var float cisdUpLegOpen      = na
+var int   cisdDownLegOpenBar = na
+var int   cisdUpLegOpenBar   = na
+var int   cisdDirState       = 0  // 0 = undefined (no candle yet), 1 = up, -1 = down
+
+var array<line>  cisdLines  = array.new_line()
+var array<label> cisdLabels = array.new_label()
+var string cisdLastOut = "n/a"
+
+bool cisdIsUpClose   = close > open
+bool cisdIsDownClose = close < open
+
+// A new run starts when direction differs from the previous non-flat candle.
+if cisdIsDownClose and cisdDirState != -1
+    cisdDownLegOpen    := open
+    cisdDownLegOpenBar := bar_index
+if cisdIsUpClose and cisdDirState != 1
+    cisdUpLegOpen    := open
+    cisdUpLegOpenBar := bar_index
+if cisdIsUpClose
+    cisdDirState := 1
+if cisdIsDownClose
+    cisdDirState := -1
+
+if showCISD
+    if not na(cisdDownLegOpen) and close > cisdDownLegOpen
+        line  newLine  = line.new(cisdDownLegOpenBar, cisdDownLegOpen, bar_index, cisdDownLegOpen, color = cisdBullColor, width = 2, style = line.style_dashed)
+        label newLabel = label.new(bar_index, cisdDownLegOpen, "CISD", style = label.style_label_up, color = cisdBullColor, textcolor = color.white, size = size.small)
+        array.push(cisdLines, newLine)
+        array.push(cisdLabels, newLabel)
+        if array.size(cisdLines) > maxCISDMarkers
+            line.delete(array.shift(cisdLines))
+            label.delete(array.shift(cisdLabels))
+        cisdDownLegOpen := na
+        cisdLastOut := "Bullish"
+
+    if not na(cisdUpLegOpen) and close < cisdUpLegOpen
+        line  newLine  = line.new(cisdUpLegOpenBar, cisdUpLegOpen, bar_index, cisdUpLegOpen, color = cisdBearColor, width = 2, style = line.style_dashed)
+        label newLabel = label.new(bar_index, cisdUpLegOpen, "CISD", style = label.style_label_down, color = cisdBearColor, textcolor = color.white, size = size.small)
+        array.push(cisdLines, newLine)
+        array.push(cisdLabels, newLabel)
+        if array.size(cisdLines) > maxCISDMarkers
+            line.delete(array.shift(cisdLines))
+            label.delete(array.shift(cisdLabels))
+        cisdUpLegOpen := na
+        cisdLastOut := "Bearish"
+
+// ============================= FVG (Fair Value Gap) =============================
+// Standard 3-candle definition: a gap between candle 1's high/low and candle 3's
+// low/high, with candle 2 as the impulse that created it. Runs every bar (not just
+// the last one) so gaps display correctly as you scroll back through history.
+// Each box is a FIXED width (fvgBoxWidth bars) set once at creation -- it does not
+// stretch forward every bar -- matching how standard FVG indicators draw them.
+// A gap is deleted outright (not just dimmed) the first time price trades back
+// into it at all, so filled gaps don't pile up and overlap other drawings.
+var array<box>   bullFvgBoxes  = array.new_box()
+var array<label> bullFvgLabels = array.new_label()
+var array<box>   bearFvgBoxes  = array.new_box()
+var array<label> bearFvgLabels = array.new_label()
+var int bullFvgCount = 0
+var int bearFvgCount = 0
+
+if showFVG
+    // Fill-check existing gaps first (iterate backward -- safe to remove while looping this way).
+    if array.size(bullFvgBoxes) > 0
+        for i = array.size(bullFvgBoxes) - 1 to 0
+            box b   = array.get(bullFvgBoxes, i)
+            float bot = box.get_bottom(b)
+            if low <= bot
+                box.delete(b)
+                label.delete(array.get(bullFvgLabels, i))
+                array.remove(bullFvgBoxes, i)
+                array.remove(bullFvgLabels, i)
+
+    if array.size(bearFvgBoxes) > 0
+        for i = array.size(bearFvgBoxes) - 1 to 0
+            box b   = array.get(bearFvgBoxes, i)
+            float top = box.get_top(b)
+            if high >= top
+                box.delete(b)
+                label.delete(array.get(bearFvgLabels, i))
+                array.remove(bearFvgBoxes, i)
+                array.remove(bearFvgLabels, i)
+
+    // Detect a new gap confirmed on this bar (candle 3 = current bar).
+    bool bullFVG = low > high[2]
+    bool bearFVG = high < low[2]
+
+    if bullFVG
+        box   newBox   = box.new(left = bar_index - 1, top = low, right = bar_index - 1 + fvgBoxWidth, bottom = high[2], bgcolor = fvgColor, border_width = 1, border_color = color.new(color.red, 30))
+        label newLabel = label.new(bar_index - 1, high[2], "FVG", style = label.style_label_up, color = color.new(color.red, 30), textcolor = color.white, size = size.tiny)
+        array.push(bullFvgBoxes, newBox)
+        array.push(bullFvgLabels, newLabel)
+        if array.size(bullFvgBoxes) > maxFVGBoxes
+            box.delete(array.shift(bullFvgBoxes))
+            label.delete(array.shift(bullFvgLabels))
+
+    if bearFVG
+        box   newBox   = box.new(left = bar_index - 1, top = low[2], right = bar_index - 1 + fvgBoxWidth, bottom = high, bgcolor = fvgColor, border_width = 1, border_color = color.new(color.red, 30))
+        label newLabel = label.new(bar_index - 1, low[2], "FVG", style = label.style_label_down, color = color.new(color.red, 30), textcolor = color.white, size = size.tiny)
+        array.push(bearFvgBoxes, newBox)
+        array.push(bearFvgLabels, newLabel)
+        if array.size(bearFvgBoxes) > maxFVGBoxes
+            box.delete(array.shift(bearFvgBoxes))
+            label.delete(array.shift(bearFvgLabels))
+
+    bullFvgCount := array.size(bullFvgBoxes)
+    bearFvgCount := array.size(bearFvgBoxes)
+
+
+// ============================= SUPPLY / DEMAND (swing-based) =============================
+// Supply = resistance zone anchored at a confirmed swing high. Demand = support zone
+// anchored at a confirmed swing low. Still extends right each bar while active (this
+// one you didn't ask to change) -- but once broken, the zone is deleted outright rather
+// than left behind dimmed, so old zones don't pile up and overlap newer ones. Broken =
+// price CLOSES through it; wicks alone don't break it, unlike the FVG fill rule above,
+// since a zone should tolerate a wick poke the way a gap shouldn't.
+// A new zone is skipped entirely if its price range overlaps an existing zone of the
+// SAME type (supply-vs-supply, demand-vs-demand) -- that's what was stacking up.
+overlapsExisting(array<box> zones, float top, float bottom) =>
+    bool found = false
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            box b = array.get(zones, i)
+            float bTop = box.get_top(b)
+            float bBot = box.get_bottom(b)
+            if bottom <= bTop and bBot <= top
+                found := true
+    found
+
+var array<box>   supplyZones  = array.new_box()
+var array<label> supplyLabels = array.new_label()
+var array<box>   demandZones  = array.new_box()
+var array<label> demandLabels = array.new_label()
+var int supplyCount = 0
+var int demandCount = 0
+
+if showSD
+    if array.size(supplyZones) > 0
+        for i = array.size(supplyZones) - 1 to 0
+            box b = array.get(supplyZones, i)
+            float top = box.get_top(b)
+            if close > top
+                box.delete(b)
+                label.delete(array.get(supplyLabels, i))
+                array.remove(supplyZones, i)
+                array.remove(supplyLabels, i)
+            else
+                box.set_right(b, bar_index)
+
+    if array.size(demandZones) > 0
+        for i = array.size(demandZones) - 1 to 0
+            box b = array.get(demandZones, i)
+            float bot = box.get_bottom(b)
+            if close < bot
+                box.delete(b)
+                label.delete(array.get(demandLabels, i))
+                array.remove(demandZones, i)
+                array.remove(demandLabels, i)
+            else
+                box.set_right(b, bar_index)
+
+    float ph = ta.pivothigh(pivotLen, pivotLen)
+    float pl = ta.pivotlow(pivotLen, pivotLen)
+
+    if not na(ph)
+        float newTop = ph
+        float newBot = ph - effectiveRowSize
+        if not overlapsExisting(supplyZones, newTop, newBot)
+            int pivotBarIdx = bar_index - pivotLen
+            box   newBox   = box.new(left = pivotBarIdx, top = newTop, right = bar_index, bottom = newBot, bgcolor = color.new(color.red, 82), border_width = 1, border_color = color.new(color.red, 40))
+            label newLabel = label.new(bar_index, newTop, "Supply", style = label.style_label_down, color = color.new(color.red, 30), textcolor = color.white, size = size.tiny)
+            array.push(supplyZones, newBox)
+            array.push(supplyLabels, newLabel)
+            if array.size(supplyZones) > maxSDZones
+                box.delete(array.shift(supplyZones))
+                label.delete(array.shift(supplyLabels))
+
+    if not na(pl)
+        float newTop = pl + effectiveRowSize
+        float newBot = pl
+        if not overlapsExisting(demandZones, newTop, newBot)
+            int pivotBarIdx = bar_index - pivotLen
+            box   newBox   = box.new(left = pivotBarIdx, top = newTop, right = bar_index, bottom = newBot, bgcolor = color.new(color.green, 82), border_width = 1, border_color = color.new(color.green, 40))
+            label newLabel = label.new(bar_index, newBot, "Demand", style = label.style_label_up, color = color.new(color.green, 30), textcolor = color.white, size = size.tiny)
+            array.push(demandZones, newBox)
+            array.push(demandLabels, newLabel)
+            if array.size(demandZones) > maxSDZones
+                box.delete(array.shift(demandZones))
+                label.delete(array.shift(demandLabels))
+
+    supplyCount := array.size(supplyZones)
+    demandCount := array.size(demandZones)
+
+// ============================= LOW RESISTANCE LIQUIDITY (approximate score) =============================
+// Not a mechanical ICT definition -- there isn't one to code. This counts how many of the
+// Supply/Demand zones tracked in the section above are currently active above price and
+// below price separately: fewer zones in the way on a given side reads as a "low
+// resistance" path in that direction, more reads as "high resistance." Read it as a rough
+// filter on conviction/size, not a signal.
+var int obstaclesAbove = 0
+var int obstaclesBelow = 0
+
+if showLRL
+    int aboveCount = 0
+    if array.size(supplyZones) > 0
+        for i = 0 to array.size(supplyZones) - 1
+            box b = array.get(supplyZones, i)
+            if box.get_bottom(b) > close
+                aboveCount += 1
+
+    int belowCount = 0
+    if array.size(demandZones) > 0
+        for i = 0 to array.size(demandZones) - 1
+            box b = array.get(demandZones, i)
+            if box.get_top(b) < close
+                belowCount += 1
+
+    obstaclesAbove := aboveCount
+    obstaclesBelow := belowCount
+
+// ============================= ORDER BLOCK =============================
+// The last opposing candle before an impulsive break: a bearish candle right before
+// a strong bullish breakout marks a bullish (support-like) block, and the mirror image
+// marks a bearish (resistance-like) block. "Impulsive" = that breakout candle's range
+// exceeds obImpulseAtrMult x this chart's own recent ATR (a different, shorter-period
+// ATR than the daily one used for Volume Profile/Supply-Demand sizing, since this needs
+// to judge a single candle against recent LOCAL volatility, not a daily range).
+// Fixed-width boxes like FVG, deleted outright once mitigated -- but mitigation here is
+// first-touch-of-the-near-edge, not the full-fill rule used for FVG, since that's the
+// more standard reading of "mitigated" for an order block. Overlap-checked the same way
+// Supply/Demand zones are, using the same helper function.
+float chartATR      = ta.atr(14)
+bool  impulsiveUp   = (close - open) > 0 and (high - low) > obImpulseAtrMult * chartATR
+bool  impulsiveDown = (close - open) < 0 and (high - low) > obImpulseAtrMult * chartATR
+bool  bullOB = (close[1] - open[1]) < 0 and impulsiveUp
+bool  bearOB = (close[1] - open[1]) > 0 and impulsiveDown
+
+var array<box>   bullObBoxes  = array.new_box()
+var array<label> bullObLabels = array.new_label()
+var array<box>   bearObBoxes  = array.new_box()
+var array<label> bearObLabels = array.new_label()
+var int bullObCount = 0
+var int bearObCount = 0
+
+if showOB
+    if array.size(bullObBoxes) > 0
+        for i = array.size(bullObBoxes) - 1 to 0
+            box b = array.get(bullObBoxes, i)
+            float top = box.get_top(b)
+            if low <= top
+                box.delete(b)
+                label.delete(array.get(bullObLabels, i))
+                array.remove(bullObBoxes, i)
+                array.remove(bullObLabels, i)
+
+    if array.size(bearObBoxes) > 0
+        for i = array.size(bearObBoxes) - 1 to 0
+            box b = array.get(bearObBoxes, i)
+            float bot = box.get_bottom(b)
+            if high >= bot
+                box.delete(b)
+                label.delete(array.get(bearObLabels, i))
+                array.remove(bearObBoxes, i)
+                array.remove(bearObLabels, i)
+
+    if bullOB
+        float newTop = high[1]
+        float newBot = low[1]
+        if not overlapsExisting(bullObBoxes, newTop, newBot)
+            box   newBox   = box.new(left = bar_index - 1, top = newTop, right = bar_index - 1 + obBoxWidth, bottom = newBot, bgcolor = obColor, border_width = 1, border_color = color.new(color.orange, 30))
+            label newLabel = label.new(bar_index - 1, newBot, "Order Block", style = label.style_label_up, color = color.new(color.orange, 30), textcolor = color.white, size = size.tiny)
+            array.push(bullObBoxes, newBox)
+            array.push(bullObLabels, newLabel)
+            if array.size(bullObBoxes) > maxOBBoxes
+                box.delete(array.shift(bullObBoxes))
+                label.delete(array.shift(bullObLabels))
+
+    if bearOB
+        float newTop = high[1]
+        float newBot = low[1]
+        if not overlapsExisting(bearObBoxes, newTop, newBot)
+            box   newBox   = box.new(left = bar_index - 1, top = newTop, right = bar_index - 1 + obBoxWidth, bottom = newBot, bgcolor = obColor, border_width = 1, border_color = color.new(color.orange, 30))
+            label newLabel = label.new(bar_index - 1, newTop, "Order Block", style = label.style_label_down, color = color.new(color.orange, 30), textcolor = color.white, size = size.tiny)
+            array.push(bearObBoxes, newBox)
+            array.push(bearObLabels, newLabel)
+            if array.size(bearObBoxes) > maxOBBoxes
+                box.delete(array.shift(bearObBoxes))
+                label.delete(array.shift(bearObLabels))
+
+    bullObCount := array.size(bullObBoxes)
+    bearObCount := array.size(bearObBoxes)
+
+// ============================= DELTA (approximation) =============================
+var float cumDelta = 0.0
+float dayChange = ta.change(time("D"))
+bool newSessionDelta = resetSessionDelta and dayChange != 0
+if newSessionDelta
+    cumDelta := 0.0
+
+[upVol, downVol] = request.security_lower_tf(syminfo.tickerid, lowerTfDelta, [close > open ? volume : 0.0, close < open ? volume : 0.0])
+float barDelta = array.sum(upVol) - array.sum(downVol)
+if not na(barDelta)
+    cumDelta += barDelta
+
+// ============================= DASHBOARD TABLE =============================
+var table dash = table.new(position.top_right, 2, 11, border_width = 1, bgcolor = color.new(color.black, 20))
+
+if barstate.islast
+    table.cell(dash, 0, 0, "COT Net", text_color = color.white)
+    table.cell(dash, 1, 0, na(cotNet) ? "off" : str.tostring(math.round(cotNet)), text_color = color.white)
+
+    table.cell(dash, 0, 1, "COT Index", text_color = color.white)
+    table.cell(dash, 1, 1, na(cotIndex) ? "n/a" : str.tostring(math.round(cotIndex)),
+         text_color = (not na(cotIndex) and (cotIndex >= 90 or cotIndex <= 10)) ? color.yellow : color.white)
+
+    table.cell(dash, 0, 2, "Cum Delta", text_color = color.white)
+    table.cell(dash, 1, 2, str.tostring(math.round(cumDelta)), text_color = cumDelta >= 0 ? color.teal : color.maroon)
+
+    table.cell(dash, 0, 3, "POC (approx)", text_color = color.white)
+    table.cell(dash, 1, 3, na(pocPriceOut) ? "n/a" : str.tostring(pocPriceOut, format.mintick), text_color = color.orange)
+
+    table.cell(dash, 0, 4, "Bin Size", text_color = color.white)
+    table.cell(dash, 1, 4, str.tostring(effectiveRowSize, format.mintick) + (autoBinSize ? " (auto)" : " (manual)"), text_color = color.gray)
+
+    table.cell(dash, 0, 5, "Active FVGs", text_color = color.white)
+    table.cell(dash, 1, 5, str.tostring(bullFvgCount) + " bull / " + str.tostring(bearFvgCount) + " bear", text_color = color.gray)
+
+    table.cell(dash, 0, 6, "Active S/D Zones", text_color = color.white)
+    table.cell(dash, 1, 6, str.tostring(supplyCount) + " sup / " + str.tostring(demandCount) + " dem", text_color = color.gray)
+
+    table.cell(dash, 0, 7, "Active Order Blocks", text_color = color.white)
+    table.cell(dash, 1, 7, str.tostring(bullObCount) + " bull / " + str.tostring(bearObCount) + " bear", text_color = color.gray)
+
+    table.cell(dash, 0, 8, "MS Trend", text_color = color.white)
+    table.cell(dash, 1, 8, msTrend == 1 ? "Up" : msTrend == -1 ? "Down" : "n/a", text_color = msTrend == 1 ? color.teal : msTrend == -1 ? color.maroon : color.gray)
+
+    table.cell(dash, 0, 9, "LRL (approx.)", text_color = color.white)
+    table.cell(dash, 1, 9, "up " + str.tostring(obstaclesAbove) + " / dn " + str.tostring(obstaclesBelow), text_color = color.gray)
+
+    table.cell(dash, 0, 10, "Last CISD", text_color = color.white)
+    table.cell(dash, 1, 10, cisdLastOut, text_color = cisdLastOut == "Bullish" ? color.aqua : cisdLastOut == "Bearish" ? color.maroon : color.gray)
