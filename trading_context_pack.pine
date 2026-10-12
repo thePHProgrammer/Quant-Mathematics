@@ -1282,6 +1282,7 @@ float mtfTargetR   = input.float(2.0, "Target (R multiple, priced from trigger c
 float mtfMinRR     = input.float(1.5, "Risk gate: min reward:risk after costs", minval = 0.0, step = 0.1, group = "MTF Trade Rules")
 int   mtfMaxHold   = input.int(48, "Time exit after (bars in trade)", minval = 1, maxval = 2000, group = "MTF Trade Rules")
 int   mtfMaxPerZone = input.int(1, "Max setups per AOI zone", minval = 1, maxval = 10, tooltip = "1 = first-touch hypothesis.", group = "MTF Trade Rules")
+bool  mtfOnePos    = input.bool(true, "One trade at a time", tooltip = "On: a trigger while another setup is Triggered/Open is Rejected(busy) -- matches what the strategy can execute, but makes models path-dependent (a model that filters out trade X may then take trade Y that X would have blocked). Off: the R ledger books every trigger independently, so each model's trades are an exact subset of Model A's -- use this for the pure feature comparison. The strategy then only executes triggers while flat.", group = "MTF Trade Rules")
 bool  mtfSessOn    = input.bool(false, "Only arm setups inside session", group = "MTF Trade Rules")
 string mtfSessStr  = input.string("0200-0500,0830-1100,1330-1600", "Session (New York time)", tooltip = "Comma-separated ranges. Default = London / NY AM / NY PM kill zones.", group = "MTF Trade Rules")
 // Costs used by the risk gate and the R ledger. Keep them EQUAL to the strategy's
@@ -1537,7 +1538,20 @@ if barstate.islast
         float oB = mtfHtfTrend == 1 ? mtfRgHi - mtfOteHi * rng : mtfRgLo + mtfOteLo * rng
         array.push(mtfOteBoxes, box.new(time[math.min(bar_index, 30)], oT, time, oB, xloc = xloc.bar_time, extend = extend.right, border_color = color.new(color.purple, 40), border_style = line.style_dashed, bgcolor = color.new(color.purple, 92), text = mtfHtfName + " OTE", text_size = size.tiny, text_color = color.new(color.purple, 20), text_halign = text.align_left))
 
-// Records every feature fact on the setup, then applies the research toggles.
+// ============================= MTF ENGINE: MODELS (ablation ladder) =============================
+// Each feature enters the cumulative ladder exactly once; "A+X" runs add ONE filter to the
+// baseline so each feature's marginal effect is measured against the same trades.
+//   A: T0 only | B: +Struct | C: +Sweep | D: +P/D | E: +Disp | F: +CE
+// Zone definitions, AOI, trigger, stop, target, costs, sizing, session and window are identical.
+string mtfModel = input.string("A", "Model", options = ["A", "B", "C", "D", "E", "F", "A+Struct", "A+Sweep", "A+PD", "A+Disp", "A+CE"], tooltip = "A = baseline T0. B = A + HTF structure aligned. C = B + chart-TF liquidity sweep. D = C + Discount (long) / Premium (short). E = D + displacement trigger candle. F = E + AOI CE touched. A+X = baseline plus one filter.", group = "MTF Model")
+bool mtfUseStruct = mtfModel == "B" or mtfModel == "C" or mtfModel == "D" or mtfModel == "E" or mtfModel == "F" or mtfModel == "A+Struct"
+bool mtfUseSweep  = mtfModel == "C" or mtfModel == "D" or mtfModel == "E" or mtfModel == "F" or mtfModel == "A+Sweep"
+bool mtfUsePD     = mtfModel == "D" or mtfModel == "E" or mtfModel == "F" or mtfModel == "A+PD"
+bool mtfUseDisp   = mtfModel == "E" or mtfModel == "F" or mtfModel == "A+Disp"
+bool mtfUseCE     = mtfModel == "F" or mtfModel == "A+CE"
+string mtfModelTxt = mtfModel + " [" + (mtfUseStruct ? "Struct " : "") + (mtfUseSweep ? "Sweep " : "") + (mtfUsePD ? "PD " : "") + (mtfUseDisp ? "Disp " : "") + (mtfUseCE ? "CE " : "") + (mtfXEq ? "+EQ " : "") + (mtfXOte ? "+OTE " : "") + (mtfXVol ? "+RelVol " : "") + (mtfFlipAOI ? "+FlipAOI " : "") + (mtfTrigMode == "T0 reaction close" ? "T0" : "T1") + "]"
+
+// Records every feature fact on the setup, then applies the model filters and research toggles.
 // Returns "" if the setup passes, else the name of the first failing requirement.
 mtf_filterFail(MtfSetup s) =>
     s.fStruct := mtfHtfTrend == s.dir
@@ -1548,7 +1562,7 @@ mtf_filterFail(MtfSetup s) =>
     bool eqOk  = not mtfXEq or (s.dir == 1 ? mtf_recent(mtfBullEqSwpBar, mtfSweepBars) : mtf_recent(mtfBearEqSwpBar, mtfSweepBars))
     bool oteOk = not mtfXOte or mtf_inOte(close, s.dir)
     bool volOk = not mtfXVol or not (s.z.kind == "OB" or s.z.kind == "Breaker") or (not na(s.z.relVol) and s.z.relVol >= mtfMinRelVol)
-    not eqOk ? "EQsweep" : not oteOk ? "OTE" : not volOk ? "RelVol" : ""
+    mtfUseStruct and not s.fStruct ? "Struct" : mtfUseSweep and not s.fSweep ? "Sweep" : mtfUsePD and not s.fPD ? "PD" : mtfUseDisp and not s.fDisp ? "Disp" : mtfUseCE and not s.fCE ? "CE" : not eqOk ? "EQsweep" : not oteOk ? "OTE" : not volOk ? "RelVol" : ""
 
 if barstate.isconfirmed
     // ---- 1) fills and exits of setups already in flight ----
@@ -1620,7 +1634,7 @@ if barstate.isconfirmed
                 string fail = mtf_filterFail(s)
                 if fail != ""
                     mtf_end(mtfSt, s, "Rejected", fail)
-                else if busy
+                else if busy and mtfOnePos
                     mtf_end(mtfSt, s, "Rejected", "busy")
                 else if risk <= 0 or rrNet < mtfMinRR
                     mtf_end(mtfSt, s, "Rejected", "risk")
@@ -1736,6 +1750,9 @@ if barstate.islast
 
     table.cell(dash, 0, 18, "Ledger (net R)", text_color = color.white)
     table.cell(dash, 1, 18, mtfSt.nTrades == 0 ? "no trades" : str.tostring(mtfSt.nTrades) + " trades, exp " + str.tostring(mtfSt.sumR / mtfSt.nTrades, "#.##") + "R, maxDD " + str.tostring(mtfSt.maxDD, "#.#") + "R", text_color = mtfSt.sumR >= 0 ? color.teal : color.maroon)
+
+    table.cell(dash, 0, 19, "Model", text_color = color.white)
+    table.cell(dash, 1, 19, mtfModelTxt, text_color = color.gray)
 
     if mtfLtfMissing > 0
         table.cell(dash, 0, 22, "LTF bars w/o intrabars", text_color = color.white)
