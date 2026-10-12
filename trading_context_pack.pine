@@ -960,6 +960,7 @@ type MtfZone
     int    setupCount     = 0
     bool   setupLive      = false
     float  relVol         = na
+    string lastSetup      = ""
     box    bx             = na
     line   ce             = na
     label  lb             = na
@@ -1190,6 +1191,83 @@ if barstate.islast
 mtf_zoneTxt(MtfZone z) =>
     na(z) ? "none" : "#" + str.tostring(z.id) + " " + z.tf + " " + z.kind + (z.dir == 1 ? " bull" : " bear") + ": " + z.validity + ", touches " + str.tostring(z.touchCount) + (z.ceTouched ? ", CE hit" : "") + (z.filled ? ", filled" : "")
 
+// ============================= MTF ENGINE: AREA OF INTEREST (context, not an entry) =============================
+// An AOI only says WHERE to pay attention. It never fires a trade by itself: a setup also needs
+// a Trigger (Phase 4) and must pass the Risk gate. Confluence is shown as 4 categories instead
+// of a point count, so correlated facts aren't double-counted:
+//   L = Location   price is inside the AOI (gate)          + Disc/Prem of the HTF dealing range (info)
+//   S = Structure  HTF structure direction == AOI direction (one flag; chart BOS not counted again)
+//   T = Trigger    a setup on this AOI has triggered
+//   R = Risk       that setup passed the cost-adjusted reward:risk gate
+string mtfAoiMode  = input.string("HTF zone", "AOI definition", options = ["HTF zone", "HTF zone ∩ lower-TF zone"], tooltip = "HTF zone: any Active HTF OB/FVG is an AOI. Intersection: only the part of an HTF zone that overlaps an Active same-direction chart-TF or LTF zone. Frozen across models A-F.", group = "MTF Setups")
+bool   mtfShowAoi  = input.bool(true, "Show AOI boxes", group = "MTF Setups")
+bool   mtfShowPD   = input.bool(true, "Show Premium / Discount of HTF dealing range", group = "MTF Setups")
+bool   mtfFlipAOI  = false  // Phase 5 toggle (IFVG/Breaker as AOIs) is wired below
+
+// A zone qualifies as an AOI source if it is an HTF zone that is still valid.
+mtf_isAoiZone(MtfZone z, bool flipAoi) =>
+    z.validity == "Active" or (flipAoi and z.validity == "Flipped")
+
+// Returns [ok, top, bot] of the AOI built from HTF zone z. In intersection mode, uses the
+// largest overlap with any valid same-direction chart-TF or LTF zone.
+mtf_aoi(MtfZone z, string mode) =>
+    bool  ok  = mode == "HTF zone"
+    float top = z.top
+    float bot = z.bot
+    if not ok
+        float best = 0.0
+        for k = 0 to 1
+            array<MtfZone> src = k == 0 ? mtfZonesC : mtfZonesL
+            for o in src
+                if o.dir == z.dir and (o.validity == "Active" or o.validity == "Flipped")
+                    float t = math.min(z.top, o.top)
+                    float b = math.max(z.bot, o.bot)
+                    if t > b and t - b > best
+                        best := t - b
+                        top  := t
+                        bot  := b
+                        ok   := true
+    [ok, top, bot]
+
+float mtfEq = na(mtfRgHi) or na(mtfRgLo) ? na : (mtfRgHi + mtfRgLo) / 2
+mtf_pdTxt(float px) =>
+    na(mtfEq) ? "P/D n/a" : px < mtfEq ? "Disc" : px > mtfEq ? "Prem" : "EQ"
+
+var array<box>   mtfAoiBoxes = array.new<box>()
+var array<box>   mtfPdBoxes  = array.new<box>()
+var array<line>  mtfPdLines  = array.new<line>()
+
+mtf_drawAoiAndPD() =>
+    for b in mtfAoiBoxes
+        box.delete(b)
+    array.clear(mtfAoiBoxes)
+    for b in mtfPdBoxes
+        box.delete(b)
+    array.clear(mtfPdBoxes)
+    for l in mtfPdLines
+        line.delete(l)
+    array.clear(mtfPdLines)
+    if mtfShowAoi
+        for z in mtfZonesH
+            if mtf_isAoiZone(z, mtfFlipAOI)
+                [ok, aTop, aBot] = mtf_aoi(z, mtfAoiMode)
+                if ok
+                    bool   inL  = high >= aBot and low <= aTop
+                    bool   inS  = mtfHtfTrend == z.dir
+                    bool   inT  = z.lastSetup == "Triggered" or z.lastSetup == "Open" or z.lastSetup == "Closed"
+                    string rTxt = inT ? "✓" : z.lastSetup == "Rejected:risk" ? "✗" : "–"
+                    color  c    = z.dir == 1 ? color.green : color.red
+                    string txt  = (z.dir == 1 ? "BUY AOI " : "SELL AOI ") + z.tf + " " + z.kind + " · L" + (inL ? "✓" : "–") + " S" + (inS ? "✓" : "–") + " T" + (inT ? "✓" : "–") + " R" + rTxt + " · " + mtf_pdTxt((aTop + aBot) / 2)
+                    array.push(mtfAoiBoxes, box.new(z.originTime, aTop, time, aBot, xloc = xloc.bar_time, extend = extend.right, border_color = color.new(c, 10), border_width = 2, bgcolor = color.new(c, 88), text = txt, text_size = size.small, text_color = color.new(c, 0), text_halign = text.align_right, text_valign = z.dir == 1 ? text.align_bottom : text.align_top))
+    if mtfShowPD and not na(mtfEq)
+        int leftT = time[math.min(bar_index, 50)]
+        array.push(mtfPdBoxes, box.new(leftT, mtfRgHi, time, mtfEq, xloc = xloc.bar_time, extend = extend.right, border_width = 0, bgcolor = color.new(color.red, 94), text = mtfHtfName + " Premium", text_size = size.tiny, text_color = color.new(color.red, 40), text_halign = text.align_left, text_valign = text.align_top))
+        array.push(mtfPdBoxes, box.new(leftT, mtfEq, time, mtfRgLo, xloc = xloc.bar_time, extend = extend.right, border_width = 0, bgcolor = color.new(color.green, 94), text = mtfHtfName + " Discount", text_size = size.tiny, text_color = color.new(color.green, 40), text_halign = text.align_left, text_valign = text.align_bottom))
+        array.push(mtfPdLines, line.new(leftT, mtfEq, time, mtfEq, xloc = xloc.bar_time, extend = extend.right, color = color.new(color.gray, 30), style = line.style_dotted))
+
+if barstate.islast
+    mtf_drawAoiAndPD()
+
 // ==== ENGINE END (keep in sync) ====
 
 mtf_trendTxt(int t) =>
@@ -1249,6 +1327,9 @@ if barstate.islast
 
     table.cell(dash, 0, 15, "Newest HTF zone", text_color = color.white)
     table.cell(dash, 1, 15, array.size(mtfZonesH) > 0 ? mtf_zoneTxt(array.last(mtfZonesH)) : "none", text_color = color.gray)
+
+    table.cell(dash, 0, 16, "Location (HTF range)", text_color = color.white)
+    table.cell(dash, 1, 16, mtf_pdTxt(close) + (na(mtfEq) ? "" : "  EQ " + str.tostring(mtfEq, format.mintick)), text_color = mtf_pdTxt(close) == "Disc" ? color.teal : mtf_pdTxt(close) == "Prem" ? color.maroon : color.gray)
 
     if mtfLtfMissing > 0
         table.cell(dash, 0, 22, "LTF bars w/o intrabars", text_color = color.white)
