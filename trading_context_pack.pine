@@ -1265,10 +1265,300 @@ mtf_drawAoiAndPD() =>
         array.push(mtfPdBoxes, box.new(leftT, mtfEq, time, mtfRgLo, xloc = xloc.bar_time, extend = extend.right, border_width = 0, bgcolor = color.new(color.green, 94), text = mtfHtfName + " Discount", text_size = size.tiny, text_color = color.new(color.green, 40), text_halign = text.align_left, text_valign = text.align_bottom))
         array.push(mtfPdLines, line.new(leftT, mtfEq, time, mtfEq, xloc = xloc.bar_time, extend = extend.right, color = color.new(color.gray, 30), style = line.style_dotted))
 
+
+// ============================= MTF ENGINE: TRADE RULES (the testable hypothesis) =============================
+// Baseline trigger T0 contains NONE of the features being tested:
+//   price enters a valid HTF AOI (new touch) -> the first chart bar (arming bar included) that
+//   closes in the trade direction AND beyond the prior bar's extreme (long: close > open and
+//   close > high[1]) within the trigger window -> market entry at the NEXT bar's open.
+// Only the FIRST T0 in the window is evaluated: if the model's filters or the risk gate reject it,
+// the setup ends (Rejected) -- it does not wait for a "better" bar. That keeps every model's
+// trades an exact subset of Model A's, so comparisons test the filter and nothing else.
+// Stop  = AOI far edge -/+ stopBuf x ATR14 (at trigger). Target = targetR x (trigger close - stop),
+// priced at trigger. Both fixed for every model. Time exit after maxHold bars (at next open).
+int   mtfTrigWin   = input.int(12, "Trigger window (bars after AOI touch, incl. touch bar)", minval = 1, maxval = 200, group = "MTF Trade Rules")
+float mtfStopBuf   = input.float(0.10, "Stop buffer beyond AOI far edge (x ATR14)", minval = 0.0, step = 0.05, group = "MTF Trade Rules")
+float mtfTargetR   = input.float(2.0, "Target (R multiple, priced from trigger close)", minval = 0.5, step = 0.25, group = "MTF Trade Rules")
+float mtfMinRR     = input.float(1.5, "Risk gate: min reward:risk after costs", minval = 0.0, step = 0.1, group = "MTF Trade Rules")
+int   mtfMaxHold   = input.int(48, "Time exit after (bars in trade)", minval = 1, maxval = 2000, group = "MTF Trade Rules")
+int   mtfMaxPerZone = input.int(1, "Max setups per AOI zone", minval = 1, maxval = 10, tooltip = "1 = first-touch hypothesis.", group = "MTF Trade Rules")
+bool  mtfSessOn    = input.bool(false, "Only arm setups inside session", group = "MTF Trade Rules")
+string mtfSessStr  = input.string("0200-0500,0830-1100,1330-1600", "Session (New York time)", tooltip = "Comma-separated ranges. Default = London / NY AM / NY PM kill zones.", group = "MTF Trade Rules")
+// Costs used by the risk gate and the R ledger. Keep them EQUAL to the strategy's
+// Settings -> Properties (commission %, slippage ticks); Pine cannot read those values.
+float mtfSpreadTk  = input.float(0.0, "Cost: spread (ticks, half charged per side)", minval = 0.0, step = 1.0, group = "MTF Costs (ledger)")
+float mtfSlipTk    = input.float(2.0, "Cost: slippage (ticks per market/stop fill)", minval = 0.0, step = 1.0, group = "MTF Costs (ledger)")
+float mtfCommPct   = input.float(0.01, "Cost: commission (% of price per side)", minval = 0.0, step = 0.005, group = "MTF Costs (ledger)")
+// Research window: setups are only ARMED inside it, so stats never mix in- and out-of-sample.
+string mtfWinMode  = input.string("All", "Research window", options = ["All", "In-sample", "Out-of-sample"], group = "MTF Research Window")
+int    mtfSplitT   = input.time(timestamp("2025-01-01T00:00:00"), "IS / OOS split (OOS starts here)", group = "MTF Research Window")
+int    mtfStartT   = input.time(timestamp("2015-01-01T00:00:00"), "Window start", group = "MTF Research Window")
+bool   mtfShowTrades = input.bool(true, "Show setup markers and stop/target lines", group = "MTF Setups")
+
+float mtfAtr   = ta.atr(14)
+bool  mtfT0Up  = close > open and close > high[1]
+bool  mtfT0Dn  = close < open and close < low[1]
+bool  mtfInSess = not mtfSessOn or not na(time(timeframe.period, mtfSessStr + ":1234567", "America/New_York"))
+bool  mtfInWin = time >= mtfStartT and (mtfWinMode == "All" or (mtfWinMode == "In-sample" ? time < mtfSplitT : time >= mtfSplitT))
+
+mtf_costSide(float px, bool withSlip) =>
+    0.5 * mtfSpreadTk * syminfo.mintick + (withSlip ? mtfSlipTk * syminfo.mintick : 0.0) + px * mtfCommPct / 100
+
+// Net R of a fill pair. Limit (TP) exits pay no slippage, matching the broker emulator.
+mtf_rMult(MtfSetup s, float exitPx, bool limitExit) =>
+    float risk0 = s.dir == 1 ? s.entry - s.stop : s.stop - s.entry
+    float cE = mtf_costSide(s.entry, true)
+    float cX = mtf_costSide(exitPx, not limitExit)
+    risk0 <= 0 ? -1.0 : s.dir == 1 ? ((exitPx - cX) - (s.entry + cE)) / risk0 : ((s.entry - cE) - (exitPx + cX)) / risk0
+
+// New York-time session bucket for stats.
+mtf_sessBucket(int t) =>
+    int hr = hour(t, "America/New_York")
+    hr >= 2 and hr < 8 ? "London" : hr >= 8 and hr < 12 ? "NY AM" : hr >= 12 and hr < 17 ? "NY PM" : "Asia/Other"
+
+type MtfStats
+    int   nArmed    = 0
+    int   nExpired  = 0
+    int   nCancel   = 0
+    int   nRejFilt  = 0
+    int   nRejRisk  = 0
+    int   nRejBusy  = 0
+    int   nTrades   = 0
+    int   nWins     = 0
+    int   nAmbig    = 0
+    float sumR      = 0.0
+    float grossWin  = 0.0
+    float grossLoss = 0.0
+    float eqR       = 0.0
+    float peakR     = 0.0
+    float maxDD     = 0.0
+    int   sumHold   = 0
+    float sumMae    = 0.0
+    float sumMfe    = 0.0
+    array<int>   flagN
+    array<float> flagR
+    array<int>   sessN
+    array<float> sessR
+
+var MtfStats mtfSt = MtfStats.new(flagN = array.new<int>(10, 0), flagR = array.new<float>(10, 0.0), sessN = array.new<int>(4, 0), sessR = array.new<float>(4, 0.0))
+var array<MtfSetup> mtfSetups = array.new<MtfSetup>()
+var int mtfSetupCtr = 0
+var array<label> mtfMarks = array.new<label>()
+var array<line>  mtfLvls  = array.new<line>()
+
+mtf_mark(label l) =>
+    array.push(mtfMarks, l)
+    if array.size(mtfMarks) > 120
+        label.delete(array.shift(mtfMarks))
+
+mtf_lvl(line l) =>
+    array.push(mtfLvls, l)
+    if array.size(mtfLvls) > 120
+        line.delete(array.shift(mtfLvls))
+
+mtf_num(float v) =>
+    na(v) ? "" : str.tostring(v)
+
+// One CSV line per terminal setup state in Pine Logs (copy out for offline analysis).
+// Columns: id,dir,state,reason,zone,trigTime,entry,stop,target,exit,R,holdBars,MAE_R,MFE_R,
+//          ambiguous,fStruct,fSweep,fPD,fDisp,fCE,session
+mtf_log(MtfSetup s) =>
+    string tt = na(s.trigTime) ? "" : str.format_time(s.trigTime, "yyyy-MM-dd HH:mm", "America/New_York")
+    string hold = na(s.exitBar) or na(s.entryBar) ? "" : str.tostring(s.exitBar - s.entryBar + 1)
+    log.info("SETUP," + str.tostring(s.id) + "," + (s.dir == 1 ? "long" : "short") + "," + s.state + "," + s.reason + "," + s.z.tf + " " + s.z.kind + "," + tt + "," + mtf_num(s.entry) + "," + mtf_num(s.stop) + "," + mtf_num(s.target) + "," + mtf_num(s.exitPrice) + "," + mtf_num(s.rMult) + "," + hold + "," + mtf_num(s.mae) + "," + mtf_num(s.mfe) + "," + str.tostring(s.ambiguous) + "," + str.tostring(s.fStruct) + "," + str.tostring(s.fSweep) + "," + str.tostring(s.fPD) + "," + str.tostring(s.fDisp) + "," + str.tostring(s.fCE) + "," + s.session)
+
+mtf_record(MtfStats st, MtfSetup s) =>
+    float r = s.rMult
+    st.nTrades += 1
+    st.sumR += r
+    if r > 0
+        st.nWins += 1
+        st.grossWin += r
+    else
+        st.grossLoss += -r
+    if s.ambiguous
+        st.nAmbig += 1
+    st.eqR += r
+    st.peakR := math.max(st.peakR, st.eqR)
+    st.maxDD := math.max(st.maxDD, st.peakR - st.eqR)
+    st.sumHold += s.exitBar - s.entryBar + 1
+    st.sumMae += s.mae
+    st.sumMfe += s.mfe
+    array<bool> fl = array.from(s.fStruct, s.fSweep, s.fPD, s.fDisp, s.fCE)
+    for k = 0 to 4
+        int idx = k * 2 + (array.get(fl, k) ? 0 : 1)
+        array.set(st.flagN, idx, array.get(st.flagN, idx) + 1)
+        array.set(st.flagR, idx, array.get(st.flagR, idx) + r)
+    int si = s.session == "London" ? 0 : s.session == "NY AM" ? 1 : s.session == "NY PM" ? 2 : 3
+    array.set(st.sessN, si, array.get(st.sessN, si) + 1)
+    array.set(st.sessR, si, array.get(st.sessR, si) + r)
+
+mtf_close(MtfStats st, MtfSetup s, float exitPx, string why, bool limitExit) =>
+    s.state     := "Closed"
+    s.reason    := why
+    s.exitPrice := exitPx
+    s.exitBar   := bar_index
+    s.rMult     := mtf_rMult(s, exitPx, limitExit)
+    MtfZone zz = s.z
+    zz.setupLive := false
+    zz.lastSetup := "Closed"
+    mtf_record(st, s)
+    mtf_log(s)
+    if mtfShowTrades
+        mtf_lvl(line.new(s.entryBar, s.stop, bar_index, s.stop, color = color.new(color.red, 20), style = line.style_dashed))
+        mtf_lvl(line.new(s.entryBar, s.target, bar_index, s.target, color = color.new(color.teal, 20), style = line.style_dashed))
+        mtf_mark(label.new(bar_index, exitPx, str.tostring(s.rMult, "+#.##;-#.##") + "R " + why, style = label.style_label_left, color = color.new(color.black, 100), textcolor = s.rMult > 0 ? color.teal : color.maroon, size = size.tiny))
+
+mtf_end(MtfStats st, MtfSetup s, string state, string why) =>
+    s.state  := state
+    s.reason := why
+    MtfZone zz = s.z
+    zz.setupLive := false
+    zz.lastSetup := state == "Rejected" ? "Rejected:" + why : state
+    if state == "Expired"
+        st.nExpired += 1
+    else if state == "Cancelled"
+        st.nCancel += 1
+    else if why == "risk"
+        st.nRejRisk += 1
+    else if why == "busy"
+        st.nRejBusy += 1
+    else
+        st.nRejFilt += 1
+    mtf_log(s)
+
+// Per-bar engine outputs (consumed by the strategy / alerts).
+int   mtfSigDir    = 0
+int   mtfSigId     = na
+float mtfSigStop   = na
+float mtfSigTarget = na
+int   mtfArmDir    = 0
+int   mtfTimeExitId = na
+
+// Model filters on top of T0. Returns "" if the setup passes, else the name of the failing filter.
+// (Phase 4 baseline: no filters.)
+mtf_filterFail(MtfSetup s) =>
+    ""
+
+if barstate.isconfirmed
+    // ---- 1) fills and exits of setups already in flight ----
+    for s in mtfSetups
+        if s.state == "Triggered" and s.trigBar == bar_index - 1
+            s.state     := "Open"
+            s.entry     := open
+            s.entryBar  := bar_index
+            s.entryTime := time
+            MtfZone zo = s.z
+            zo.lastSetup := "Open"
+            // Gap through the stop at the open: the emulator fills entry and stop at the open
+            // (mtf_rMult books this as -1R because entry is already beyond the stop).
+            if (s.dir == 1 and open <= s.stop) or (s.dir == -1 and open >= s.stop)
+                mtf_close(mtfSt, s, open, "GapSL", false)
+        if s.state == "Open"
+            if s.timeExitPending
+                mtf_close(mtfSt, s, open, "TimeExit", false)
+            else
+                float risk0 = s.dir == 1 ? s.entry - s.stop : s.stop - s.entry
+                if risk0 > 0
+                    s.mae := math.max(s.mae, (s.dir == 1 ? s.entry - low : high - s.entry) / risk0)
+                    s.mfe := math.max(s.mfe, (s.dir == 1 ? high - s.entry : s.entry - low) / risk0)
+                bool hitSL = s.dir == 1 ? low <= s.stop : high >= s.stop
+                bool hitTP = s.dir == 1 ? high >= s.target : low <= s.target
+                if hitSL
+                    // Both touched in one bar: path unknown -> counted as a loss (conservative).
+                    s.ambiguous := hitTP
+                    float px = s.dir == 1 ? math.min(open, s.stop) : math.max(open, s.stop)
+                    mtf_close(mtfSt, s, px, "SL", false)
+                else if hitTP
+                    float px = s.dir == 1 ? math.max(open, s.target) : math.min(open, s.target)
+                    mtf_close(mtfSt, s, px, "TP", true)
+                else if bar_index - s.entryBar + 1 >= mtfMaxHold
+                    s.timeExitPending := true
+                    mtfTimeExitId := s.id
+    // ---- 2) arm new setups: a valid HTF AOI was touched (price left and came back) ----
+    if mtfInWin and mtfInSess
+        for z in mtfZonesH
+            if z.newTouch and mtf_isAoiZone(z, mtfFlipAOI) and not z.setupLive and z.setupCount < mtfMaxPerZone
+                [ok, aTop, aBot] = mtf_aoi(z, mtfAoiMode)
+                if ok
+                    mtfSetupCtr += 1
+                    z.setupCount += 1
+                    z.setupLive  := true
+                    z.lastSetup  := "Armed"
+                    array.push(mtfSetups, MtfSetup.new(id = mtfSetupCtr, z = z, dir = z.dir, aoiTop = aTop, aoiBot = aBot, armBar = bar_index))
+                    mtfSt.nArmed += 1
+                    mtfArmDir := z.dir
+    // ---- 3) armed setups: cancel / trigger / expire ----
+    bool busy = false
+    for s in mtfSetups
+        if s.state == "Triggered" or s.state == "Open"
+            busy := true
+    for s in mtfSetups
+        if s.state == "Armed"
+            if s.z.validity != "Active" and s.z.validity != "Flipped"
+                mtf_end(mtfSt, s, "Cancelled", "zone " + s.z.validity)
+            else if (s.dir == 1 and mtfT0Up) or (s.dir == -1 and mtfT0Dn)
+                s.trigBar   := bar_index
+                s.trigTime  := time
+                s.trigClose := close
+                s.session   := mtf_sessBucket(time)
+                s.stop      := s.dir == 1 ? s.aoiBot - mtfStopBuf * mtfAtr : s.aoiTop + mtfStopBuf * mtfAtr
+                float risk  = s.dir == 1 ? close - s.stop : s.stop - close
+                s.target    := s.dir == 1 ? close + mtfTargetR * risk : close - mtfTargetR * risk
+                float cost  = mtf_costSide(close, true)
+                float rrNet = risk > 0 ? (mtfTargetR * risk - 2 * cost) / (risk + 2 * cost) : -1.0
+                string fail = mtf_filterFail(s)
+                if fail != ""
+                    mtf_end(mtfSt, s, "Rejected", fail)
+                else if busy
+                    mtf_end(mtfSt, s, "Rejected", "busy")
+                else if risk <= 0 or rrNet < mtfMinRR
+                    mtf_end(mtfSt, s, "Rejected", "risk")
+                else
+                    s.state := "Triggered"
+                    MtfZone zt = s.z
+                    zt.lastSetup := "Triggered"
+                    busy := true
+                    mtfSigDir    := s.dir
+                    mtfSigId     := s.id
+                    mtfSigStop   := s.stop
+                    mtfSigTarget := s.target
+                    if mtfShowTrades
+                        mtf_mark(label.new(bar_index, s.dir == 1 ? low : high, (s.dir == 1 ? "▲ BUY #" : "▼ SELL #") + str.tostring(s.id), style = s.dir == 1 ? label.style_label_up : label.style_label_down, color = s.dir == 1 ? color.teal : color.maroon, textcolor = color.white, size = size.small))
+            else if bar_index - s.armBar + 1 >= mtfTrigWin
+                mtf_end(mtfSt, s, "Expired", "no trigger")
+    // ---- 4) drop finished setups; keep stop/target lines of open trades stretched ----
+    int nS = array.size(mtfSetups)
+    if nS > 0
+        for i = nS - 1 to 0
+            MtfSetup s = array.get(mtfSetups, i)
+            if s.state != "Armed" and s.state != "Triggered" and s.state != "Open"
+                array.remove(mtfSetups, i)
+
+// Open trade: temporary stop/target lines up to the current bar.
+var array<line> mtfOpenLvls = array.new<line>()
 if barstate.islast
     mtf_drawAoiAndPD()
+    for l in mtfOpenLvls
+        line.delete(l)
+    array.clear(mtfOpenLvls)
+    if mtfShowTrades
+        for s in mtfSetups
+            if s.state == "Open"
+                array.push(mtfOpenLvls, line.new(s.entryBar, s.stop, bar_index, s.stop, color = color.new(color.red, 20), style = line.style_dashed))
+                array.push(mtfOpenLvls, line.new(s.entryBar, s.target, bar_index, s.target, color = color.new(color.teal, 20), style = line.style_dashed))
 
 // ==== ENGINE END (keep in sync) ====
+
+// ============================= MTF ALERTS =============================
+// Each setup changes state once, on a closed bar, so each alert fires once per setup ID.
+if mtfArmDir != 0
+    alert((mtfArmDir == 1 ? "Price entered a BUY AOI (" : "Price entered a SELL AOI (") + syminfo.ticker + ") -- waiting for trigger", alert.freq_once_per_bar_close)
+if mtfSigDir != 0
+    alert((mtfSigDir == 1 ? "BUY" : "SELL") + " setup #" + str.tostring(mtfSigId) + " triggered on " + syminfo.ticker + ": entry next open, stop " + str.tostring(mtfSigStop, format.mintick) + ", target " + str.tostring(mtfSigTarget, format.mintick), alert.freq_once_per_bar_close)
+alertcondition(mtfSigDir == 1, "MTF BUY setup triggered", "MTF BUY setup triggered -- entry next bar open")
+alertcondition(mtfSigDir == -1, "MTF SELL setup triggered", "MTF SELL setup triggered -- entry next bar open")
+alertcondition(mtfArmDir != 0, "Price entered an AOI", "Price entered an MTF Buy/Sell AOI")
 
 mtf_trendTxt(int t) =>
     t == 1 ? "Up" : t == -1 ? "Down" : "n/a"
@@ -1330,6 +1620,12 @@ if barstate.islast
 
     table.cell(dash, 0, 16, "Location (HTF range)", text_color = color.white)
     table.cell(dash, 1, 16, mtf_pdTxt(close) + (na(mtfEq) ? "" : "  EQ " + str.tostring(mtfEq, format.mintick)), text_color = mtf_pdTxt(close) == "Disc" ? color.teal : mtf_pdTxt(close) == "Prem" ? color.maroon : color.gray)
+
+    table.cell(dash, 0, 17, "Setups armed / closed", text_color = color.white)
+    table.cell(dash, 1, 17, str.tostring(mtfSt.nArmed) + " / " + str.tostring(mtfSt.nTrades) + "  (exp " + str.tostring(mtfSt.nExpired) + ", rej " + str.tostring(mtfSt.nRejFilt + mtfSt.nRejRisk + mtfSt.nRejBusy) + ", canc " + str.tostring(mtfSt.nCancel) + ")", text_color = color.gray)
+
+    table.cell(dash, 0, 18, "Ledger (net R)", text_color = color.white)
+    table.cell(dash, 1, 18, mtfSt.nTrades == 0 ? "no trades" : str.tostring(mtfSt.nTrades) + " trades, exp " + str.tostring(mtfSt.sumR / mtfSt.nTrades, "#.##") + "R, maxDD " + str.tostring(mtfSt.maxDD, "#.#") + "R", text_color = mtfSt.sumR >= 0 ? color.teal : color.maroon)
 
     if mtfLtfMissing > 0
         table.cell(dash, 0, 22, "LTF bars w/o intrabars", text_color = color.white)
