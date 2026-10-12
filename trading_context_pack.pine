@@ -1140,7 +1140,8 @@ mtf_extendRight(array<MtfZone> zs, array<MtfSwing> sw) =>
 
 // ============================= MTF ENGINE: PER-BAR ZONE UPDATE =============================
 // All state changes happen on CLOSED bars only, so nothing flickers or repaints in realtime.
-bool mtfFlipOn = false
+bool mtfFlipAOI = input.bool(false, "Research: IFVG / Breaker zones can be AOIs", tooltip = "Separate experiment, not part of models A-F. Forces polarity flips on.", group = "MTF Research Features")
+bool mtfFlipOn  = input.bool(false, "Research: flip invalidated FVG/OB into IFVG/Breaker", tooltip = "Instead of disappearing, a zone closed through becomes an opposite-polarity IFVG (from FVG) or Breaker (from OB), active from the next bar; its first touch is the retest. Flipped zones are removed when closed through again.", group = "MTF Research Features") or mtfFlipAOI
 
 if barstate.isconfirmed
     // 1) existing zones/swings react to this bar
@@ -1202,7 +1203,6 @@ mtf_zoneTxt(MtfZone z) =>
 string mtfAoiMode  = input.string("HTF zone", "AOI definition", options = ["HTF zone", "HTF zone ∩ lower-TF zone"], tooltip = "HTF zone: any Active HTF OB/FVG is an AOI. Intersection: only the part of an HTF zone that overlaps an Active same-direction chart-TF or LTF zone. Frozen across models A-F.", group = "MTF Setups")
 bool   mtfShowAoi  = input.bool(true, "Show AOI boxes", group = "MTF Setups")
 bool   mtfShowPD   = input.bool(true, "Show Premium / Discount of HTF dealing range", group = "MTF Setups")
-bool   mtfFlipAOI  = false  // Phase 5 toggle (IFVG/Breaker as AOIs) is wired below
 
 // A zone qualifies as an AOI source if it is an HTF zone that is still valid.
 mtf_isAoiZone(MtfZone z, bool flipAoi) =>
@@ -1435,10 +1435,120 @@ float mtfSigTarget = na
 int   mtfArmDir    = 0
 int   mtfTimeExitId = na
 
-// Model filters on top of T0. Returns "" if the setup passes, else the name of the failing filter.
-// (Phase 4 baseline: no filters.)
+// ============================= MTF ENGINE: RESEARCH FEATURES =============================
+// Every feature here is a FACT recorded on each setup at trigger time (for the stats split and the
+// CSV log). Whether a fact is REQUIRED is decided by the model (filters) or the research toggles.
+int    mtfSweepBars = input.int(10, "Sweep lookback (bars, incl. trigger bar)", minval = 0, maxval = 200, tooltip = "Liquidity sweep = wick beyond the most recent CONFIRMED chart-TF swing, close back inside.", group = "MTF Research Features")
+string mtfTrigMode  = input.string("T0 reaction close", "Trigger variant", options = ["T0 reaction close", "T1 CE reclaim"], tooltip = "T1 = the first bar that trades through the AOI's 50% (CE) and closes back on the trade side. A separate experiment: never compare a T1 run with a T0 run as if it were a model step.", group = "MTF Research Features")
+bool   mtfXEq       = input.bool(false, "Research: require EQH/EQL sweep", group = "MTF Research Features")
+float  mtfEqAtr     = input.float(0.10, "EQH/EQL tolerance (x ATR14)", minval = 0.0, step = 0.05, group = "MTF Research Features")
+int    mtfEqExpiry  = input.int(100, "EQH/EQL expiry (bars)", minval = 5, maxval = 2000, group = "MTF Research Features")
+bool   mtfXOte      = input.bool(false, "Research: require trigger inside OTE", group = "MTF Research Features")
+float  mtfOteLo     = input.float(0.62, "OTE from", minval = 0.0, maxval = 1.0, step = 0.01, inline = "ote", group = "MTF Research Features")
+float  mtfOteHi     = input.float(0.79, "to", minval = 0.0, maxval = 1.0, step = 0.01, inline = "ote", group = "MTF Research Features")
+bool   mtfShowOte   = input.bool(false, "Show OTE band of HTF dealing range", group = "MTF Research Features")
+bool   mtfXVol      = input.bool(false, "Research: OB/Breaker AOI needs relative volume >=", inline = "rv", group = "MTF Research Features")
+float  mtfMinRelVol = input.float(1.5, "", minval = 0.0, step = 0.1, inline = "rv", tooltip = "OB candle volume / its 20-bar average. A feature to TEST, not proof of institutional activity: volume meaning differs across markets and feeds (tick volume on FX/CFD). FVG AOIs are unaffected.", group = "MTF Research Features")
+
+bool mtfDispBar = math.abs(close - open) >= mtfDispAtr * nz(mtfAtr[1], mtfAtr)
+
+// Liquidity sweep of the most recent confirmed chart-TF swing.
+var float mtfCSwHi = na
+var float mtfCSwLo = na
+var int   mtfBullSwpBar = na
+var int   mtfBearSwpBar = na
+if not na(cPH)
+    mtfCSwHi := cPH
+if not na(cPL)
+    mtfCSwLo := cPL
+if not na(mtfCSwLo) and low < mtfCSwLo and close > mtfCSwLo
+    mtfBullSwpBar := bar_index
+if not na(mtfCSwHi) and high > mtfCSwHi and close < mtfCSwHi
+    mtfBearSwpBar := bar_index
+
+// Equal highs / lows: two confirmed chart-TF swings within tolerance and expiry. A sweep is a
+// wick through the level with a close back inside; a close through it just removes the level.
+var float mtfPrevPH = na
+var int   mtfPrevPHBar = na
+var float mtfPrevPL = na
+var int   mtfPrevPLBar = na
+var float mtfEqHi = na
+var int   mtfEqHiBar = na
+var float mtfEqLo = na
+var int   mtfEqLoBar = na
+var int   mtfBullEqSwpBar = na
+var int   mtfBearEqSwpBar = na
+if barstate.isconfirmed
+    if not na(mtfEqHi) and (bar_index - mtfEqHiBar > mtfEqExpiry or close > mtfEqHi)
+        mtfEqHi := na
+    if not na(mtfEqLo) and (bar_index - mtfEqLoBar > mtfEqExpiry or close < mtfEqLo)
+        mtfEqLo := na
+    if not na(mtfEqHi) and high > mtfEqHi and close < mtfEqHi
+        mtfBearEqSwpBar := bar_index
+        if mtfShowTrades and mtfXEq
+            mtf_mark(label.new(bar_index, high, "EQH sweep", style = label.style_label_down, color = color.new(color.black, 100), textcolor = color.maroon, size = size.tiny))
+        mtfEqHi := na
+    if not na(mtfEqLo) and low < mtfEqLo and close > mtfEqLo
+        mtfBullEqSwpBar := bar_index
+        if mtfShowTrades and mtfXEq
+            mtf_mark(label.new(bar_index, low, "EQL sweep", style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.teal, size = size.tiny))
+        mtfEqLo := na
+    if not na(cPH)
+        if not na(mtfPrevPH) and bar_index - mtfPrevPHBar <= mtfEqExpiry and math.abs(cPH - mtfPrevPH) <= mtfEqAtr * mtfAtr
+            mtfEqHi    := math.max(cPH, mtfPrevPH)
+            mtfEqHiBar := bar_index
+            if mtfShowTrades and mtfXEq
+                mtf_lvl(line.new(bar_index - mtfPivLen, mtfEqHi, bar_index, mtfEqHi, color = color.new(color.maroon, 30), style = line.style_dotted))
+        mtfPrevPH    := cPH
+        mtfPrevPHBar := bar_index
+    if not na(cPL)
+        if not na(mtfPrevPL) and bar_index - mtfPrevPLBar <= mtfEqExpiry and math.abs(cPL - mtfPrevPL) <= mtfEqAtr * mtfAtr
+            mtfEqLo    := math.min(cPL, mtfPrevPL)
+            mtfEqLoBar := bar_index
+            if mtfShowTrades and mtfXEq
+                mtf_lvl(line.new(bar_index - mtfPivLen, mtfEqLo, bar_index, mtfEqLo, color = color.new(color.teal, 30), style = line.style_dotted))
+        mtfPrevPL    := cPL
+        mtfPrevPLBar := bar_index
+
+// OTE band of the HTF dealing range: longs retrace 62-79% of the up-leg (from the high down),
+// shorts retrace 62-79% of the down-leg (from the low up).
+mtf_inOte(float px, int dir) =>
+    bool ok = false
+    if not na(mtfRgHi) and not na(mtfRgLo) and mtfRgHi > mtfRgLo
+        float rng = mtfRgHi - mtfRgLo
+        ok := dir == 1 ? px <= mtfRgHi - mtfOteLo * rng and px >= mtfRgHi - mtfOteHi * rng : px >= mtfRgLo + mtfOteLo * rng and px <= mtfRgLo + mtfOteHi * rng
+    ok
+
+mtf_recent(int evBar, int lookback) =>
+    not na(evBar) and bar_index - evBar <= lookback
+
+mtf_trig(MtfSetup s) =>
+    float ce = (s.aoiTop + s.aoiBot) / 2
+    mtfTrigMode == "T0 reaction close" ? (s.dir == 1 ? mtfT0Up : mtfT0Dn) : (s.dir == 1 ? low <= ce and close > ce : high >= ce and close < ce)
+
+var array<box> mtfOteBoxes = array.new<box>()
+if barstate.islast
+    for b in mtfOteBoxes
+        box.delete(b)
+    array.clear(mtfOteBoxes)
+    if mtfShowOte and not na(mtfRgHi) and not na(mtfRgLo) and mtfRgHi > mtfRgLo and mtfHtfTrend != 0
+        float rng = mtfRgHi - mtfRgLo
+        float oT = mtfHtfTrend == 1 ? mtfRgHi - mtfOteLo * rng : mtfRgLo + mtfOteHi * rng
+        float oB = mtfHtfTrend == 1 ? mtfRgHi - mtfOteHi * rng : mtfRgLo + mtfOteLo * rng
+        array.push(mtfOteBoxes, box.new(time[math.min(bar_index, 30)], oT, time, oB, xloc = xloc.bar_time, extend = extend.right, border_color = color.new(color.purple, 40), border_style = line.style_dashed, bgcolor = color.new(color.purple, 92), text = mtfHtfName + " OTE", text_size = size.tiny, text_color = color.new(color.purple, 20), text_halign = text.align_left))
+
+// Records every feature fact on the setup, then applies the research toggles.
+// Returns "" if the setup passes, else the name of the first failing requirement.
 mtf_filterFail(MtfSetup s) =>
-    ""
+    s.fStruct := mtfHtfTrend == s.dir
+    s.fSweep  := s.dir == 1 ? mtf_recent(mtfBullSwpBar, mtfSweepBars) : mtf_recent(mtfBearSwpBar, mtfSweepBars)
+    s.fPD     := not na(mtfEq) and (s.dir == 1 ? close < mtfEq : close > mtfEq)
+    s.fDisp   := mtfDispBar
+    s.fCE     := s.z.ceTouched
+    bool eqOk  = not mtfXEq or (s.dir == 1 ? mtf_recent(mtfBullEqSwpBar, mtfSweepBars) : mtf_recent(mtfBearEqSwpBar, mtfSweepBars))
+    bool oteOk = not mtfXOte or mtf_inOte(close, s.dir)
+    bool volOk = not mtfXVol or not (s.z.kind == "OB" or s.z.kind == "Breaker") or (not na(s.z.relVol) and s.z.relVol >= mtfMinRelVol)
+    not eqOk ? "EQsweep" : not oteOk ? "OTE" : not volOk ? "RelVol" : ""
 
 if barstate.isconfirmed
     // ---- 1) fills and exits of setups already in flight ----
@@ -1497,7 +1607,7 @@ if barstate.isconfirmed
         if s.state == "Armed"
             if s.z.validity != "Active" and s.z.validity != "Flipped"
                 mtf_end(mtfSt, s, "Cancelled", "zone " + s.z.validity)
-            else if (s.dir == 1 and mtfT0Up) or (s.dir == -1 and mtfT0Dn)
+            else if mtf_trig(s)
                 s.trigBar   := bar_index
                 s.trigTime  := time
                 s.trigClose := close
