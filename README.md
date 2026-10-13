@@ -11,14 +11,21 @@ defined precisely enough to backtest.
 | `tools/sync_engine.py` | Keeps the engine block identical in both Pine files. |
 
 ## Quick start
-1. Paste `trading_context_pack.pine` into the Pine Editor, add it to a chart (any TF from 1m to 1D).
+1. Paste `trading_context_pack.pine` into the Pine Editor and add it to a chart (any TF from 1m to 1D).
    With `Auto`, the HTF and LTF follow the table in `docs/SPEC.md` (e.g. 5m chart → 1m / 1H,
    15m → 5m / 4H, 1H → 5m / 1D).
-2. HTF zones are drawn with a thick solid border, chart-TF zones with a thin border, and LTF zones
-   dashed. Bold **BUY AOI / SELL AOI** boxes mark the areas of interest. ▲/▼ markers are setups
-   that triggered.
-3. To test whether it has an edge, add `mtf_zone_strategy.pine` and follow §11 of `docs/SPEC.md`:
-   in-sample → out-of-sample, models A–F and A+X, realistic costs.
+2. **Display mode** (top of the settings):
+   - **Clean** (default): only the nearest **A+ / A BUY ZONE / SELL ZONE** boxes, trade markers and a compact table.
+   - **Standard**: adds HTF zones, swings and Premium/Discount.
+   - **Full**: everything, including the original COT / Volume Profile / S&D / CISD / SMT tools.
+3. Each zone label shows three separate things:
+   - its **quality grade**: A+ = all 4 checks pass (lower-TF overlap, HTF trend, Discount/Premium, liquidity sweep at the zone); A = 3 of 4
+   - its **setup status**: Waiting / Armed / In trade / ...
+   - its **past results** under the current settings, e.g. `won 61% of 38 · avg +0.42R · in-sample`
+
+   These are past results, not the odds of the next trade. Turn on *Grade diagnostics* to see each check.
+4. COT is off by default. It only works on futures charts (e.g. COMEX:GC1!), not on OANDA:XAUUSD.
+5. To test whether it has an edge, add `mtf_zone_strategy.pine` and follow §11 and §15 of `docs/SPEC.md`.
 
 ## Editing the engine
 Edit the block between `ENGINE START` / `ENGINE END` in `trading_context_pack.pine`, then run:

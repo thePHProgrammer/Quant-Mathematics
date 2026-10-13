@@ -21,8 +21,18 @@ indicator("Trading Context Pack (COT + Volume Profile + Delta)", overlay = true,
 import TradingView/LibraryCOT/6 as cot
 
 // ============================= INPUTS =============================
+// -- Display mode (read by the MTF engine too; every host script must define mtfDisplay) --
+// Changes DRAWINGS only. Zones, grades, setups, the R ledger and strategy results are identical
+// in every mode.
+//   Clean    = only A+/A Buy/Sell Zones, their trade markers and a compact table (default)
+//   Standard = + HTF zones/swings and Premium/Discount context
+//   Full     = everything, incl. LTF/chart-TF layers and the legacy sections below (each still
+//              behind its own toggle) -- for research and debugging
+string mtfDisplay = input.string("Clean", "Display mode", options = ["Clean", "Standard", "Full"], tooltip = "Clean: only A+/A Buy/Sell Zones, trade markers and a compact table. Standard: adds HTF zones, swings and Premium/Discount. Full: everything, including the legacy sections (each behind its own toggle). Display never changes zones, grades, setups or results.", group = "Display")
+bool   legacyOn   = mtfDisplay == "Full"
+
 // -- COT --
-bool   enableCOT      = input.bool(true, "COT: enable (turn OFF on spot/CFD symbols like XAUUSD, EURUSD)", group = "COT")
+bool   enableCOT      = input.bool(false, "COT: enable (futures symbols only)", tooltip = "Only works on futures charts (e.g. COMEX:GC1!). On spot/CFD symbols like OANDA:XAUUSD it stays off automatically unless a manual CFTC code is set.", group = "COT")
 string cftcOverride   = input.string("", "COT: manual CFTC code (blank = auto)", group = "COT")
 string reportType     = input.string("Legacy", "COT: report type", options = ["Legacy", "Disaggregated", "Financial"], group = "COT")
 bool   includeOptions = input.bool(false, "COT: include options data", group = "COT")
@@ -30,7 +40,7 @@ string longMetric     = input.string("Noncommercial Positions", "COT: metric nam
 int    cotLookback    = input.int(156, "COT: extremes lookback (bars)", minval = 20, tooltip = "156 weekly bars ~= 3 years, used to flag positioning extremes.", group = "COT")
 
 // -- Volume Profile (fixed-lookback histogram) --
-bool   showVP           = input.bool(true, "Volume Profile: show", group = "Volume Profile")
+bool   showVP           = input.bool(true, "Volume Profile: show (Full mode)", group = "Volume Profile") and legacyOn
 int    profileLookback  = input.int(200, "Volume Profile: lookback (bars)", minval = 20, maxval = 2000, tooltip = "How many recent bars the profile is built from -- a rolling window, not a session reset. Large values may slow the chart down.", group = "Volume Profile")
 int    profileWidthBars = input.int(30, "Volume Profile: max bar width (bars)", minval = 5, maxval = 200, tooltip = "How wide the single biggest bin's bar is drawn, in bars. Other bins scale relative to it.", group = "Volume Profile")
 bool   autoBinSize     = input.bool(true, "Volume Profile: auto-size bins to instrument", tooltip = "Sizes bins from this instrument's own daily ATR, so you don't have to manually re-tune this every time you switch symbols (EURUSD vs XAUUSD vs an index). Turn off to set a fixed bin size yourself.", group = "Volume Profile")
@@ -43,39 +53,39 @@ string lowerTfDelta      = input.timeframe("1", "Delta: lower timeframe", group 
 bool   resetSessionDelta = input.bool(true, "Delta: reset cumulative each session", group = "Delta")
 
 // -- FVG (Fair Value Gap) --
-bool  showFVG      = input.bool(false, "FVG: show (legacy chart-only)", tooltip = "Superseded by the MTF Engine chart-TF layer, which keeps zones until invalidated instead of deleting them on first fill. Kept for comparison.", group = "FVG")
+bool  showFVG      = input.bool(false, "FVG: show (legacy chart-only, Full mode)", tooltip = "Superseded by the MTF Engine chart-TF layer, which keeps zones until invalidated instead of deleting them on first fill. Kept for comparison.", group = "FVG") and legacyOn
 int   fvgBoxWidth  = input.int(10, "FVG: box width (bars)", minval = 1, maxval = 200, tooltip = "Fixed width for each gap box, like a standard FVG indicator -- it does not keep stretching forward until filled.", group = "FVG")
 int   maxFVGBoxes  = input.int(20, "FVG: max active gaps shown per side", minval = 1, maxval = 100, tooltip = "Oldest unfilled gap is dropped once this is exceeded.", group = "FVG")
 color fvgBullColor = input.color(color.new(color.green, 70), "FVG: bullish color", group = "FVG")
 color fvgBearColor = input.color(color.new(color.red, 70), "FVG: bearish color", group = "FVG")
 
 // -- Supply/Demand (swing-based) --
-bool showSD     = input.bool(true, "Supply/Demand: show", group = "Supply/Demand")
+bool showSD     = input.bool(true, "Supply/Demand: show (Full mode)", group = "Supply/Demand") and legacyOn
 int  pivotLen   = input.int(5, "Supply/Demand: pivot strength (bars each side)", minval = 1, maxval = 50, tooltip = "Higher = fewer, more significant swing points. A pivot only confirms this many bars after it happens (normal lag for any swing detector).", group = "Supply/Demand")
 int  maxSDZones = input.int(10, "Supply/Demand: max zones per side", minval = 1, maxval = 50, group = "Supply/Demand")
 
 // -- Order Block --
-bool  showOB           = input.bool(false, "Order Block: show (legacy chart-only)", tooltip = "Superseded by the MTF Engine chart-TF layer (OB requires a BOS, kept until invalidated). Kept for comparison.", group = "Order Block")
+bool  showOB           = input.bool(false, "Order Block: show (legacy chart-only, Full mode)", tooltip = "Superseded by the MTF Engine chart-TF layer (OB requires a BOS, kept until invalidated). Kept for comparison.", group = "Order Block") and legacyOn
 int   obBoxWidth       = input.int(15, "Order Block: box width (bars)", minval = 1, maxval = 200, tooltip = "Fixed width, same idea as FVG width -- doesn't stretch forward until mitigated.", group = "Order Block")
 float obImpulseAtrMult = input.float(1.5, "Order Block: impulse strength (x ATR)", minval = 0.5, step = 0.1, tooltip = "How much bigger than a typical recent candle the breakout candle must be to count as impulsive.", group = "Order Block")
 int   maxOBBoxes       = input.int(15, "Order Block: max active blocks per side", minval = 1, maxval = 50, group = "Order Block")
 color obColor          = input.color(color.new(color.orange, 75), "Order Block: color", group = "Order Block")
 
 // -- Market Structure (BOS/CHoCH) --
-bool  showMS        = input.bool(true, "Market Structure: show", group = "Market Structure")
+bool  showMS        = input.bool(true, "Market Structure: show (Full mode)", group = "Market Structure") and legacyOn
 int   msPivotLen    = input.int(5, "Market Structure: pivot strength (bars each side)", minval = 1, maxval = 50, group = "Market Structure")
 int   maxMSMarkers  = input.int(30, "Market Structure: max markers shown", minval = 1, maxval = 100, tooltip = "Oldest BOS/CHoCH marker is dropped once this is exceeded.", group = "Market Structure")
 color bosColor      = input.color(color.new(color.gray, 30), "Market Structure: BOS color", group = "Market Structure")
 color chochColor    = input.color(color.new(color.orange, 20), "Market Structure: CHoCH color", group = "Market Structure")
 
 // -- Kill Zones --
-bool   showKZ         = input.bool(true, "Kill Zones: show", group = "Kill Zones")
+bool   showKZ         = input.bool(true, "Kill Zones: show (Full mode)", group = "Kill Zones") and legacyOn
 string londonKZSession = input.session("0200-0500", "London Kill Zone (EST)", group = "Kill Zones")
 string nyAmKZSession   = input.session("0830-1100", "NY AM Kill Zone (EST)", group = "Kill Zones")
 string nyPmKZSession   = input.session("1330-1600", "NY PM Kill Zone (EST)", group = "Kill Zones")
 
 // -- SMT Divergence --
-bool   showSMT      = input.bool(true, "SMT: show", group = "SMT")
+bool   showSMT      = input.bool(true, "SMT: show (Full mode)", group = "SMT") and legacyOn
 string smtSymbol    = input.symbol("", "SMT: correlated symbol (blank = off)", tooltip = "e.g. FX:GBPUSD if charting EURUSD, or CME_MINI:NQ1! if charting CME_MINI:ES1!. Needs a genuinely correlated instrument on the same timeframe -- leave blank to disable.", group = "SMT")
 int    smtPivotLen  = input.int(5, "SMT: pivot strength (bars each side)", minval = 1, maxval = 50, group = "SMT")
 int    maxSMTLabels = input.int(20, "SMT: max markers shown", minval = 1, maxval = 100, group = "SMT")
@@ -85,7 +95,7 @@ int    maxSMTLabels = input.int(20, "SMT: max markers shown", minval = 1, maxval
 // first candle in the most recent run of same-direction candles, and it confirms on a full
 // BODY close through that level (a wick alone doesn't count) -- so CISD typically fires
 // earlier than a CHoCH, and more often, since it doesn't wait for an actual swing break.
-bool  showCISD       = input.bool(true, "CISD: show", group = "CISD")
+bool  showCISD       = input.bool(true, "CISD: show (Full mode)", group = "CISD") and legacyOn
 int   maxCISDMarkers = input.int(20, "CISD: max markers shown", minval = 1, maxval = 100, group = "CISD")
 color cisdBullColor  = input.color(color.new(color.aqua, 20), "CISD: bullish color", group = "CISD")
 color cisdBearColor  = input.color(color.new(color.maroon, 20), "CISD: bearish color", group = "CISD")
@@ -95,18 +105,20 @@ color cisdBearColor  = input.color(color.new(color.maroon, 20), "CISD: bearish c
 // counting how many of your own currently-active Supply/Demand zones (from the section
 // below) sit between current price and each direction. Fewer zones in the way = "low
 // resistance" reading; more = "high resistance." Treat it as a rough filter, not a signal.
-bool showLRL = input.bool(true, "Low Resistance Liquidity: show (approx.)", group = "Low Resistance Liquidity")
+bool showLRL = input.bool(true, "Low Resistance Liquidity: show (approx., Full mode)", group = "Low Resistance Liquidity") and legacyOn
 
 // ============================= COT =============================
 // Futures symbols only (e.g. CME_MINI:6E1!, CME:6B1!, COMEX:GC1! for gold futures).
 // getCFTCCode() RAISES A RUNTIME ERROR -- which halts the entire script, every section,
 // not just this one -- if the chart symbol isn't a recognized futures instrument. Spot/CFD
-// symbols like XAUUSD or EURUSD will trip that, so it's gated behind "COT: enable":
-// leave it OFF on a spot/CFD chart, turn it ON only when charting the actual futures
-// contract (e.g. switch XAUUSD to COMEX:GC1! or COMEX_MINI:MGC1! to get gold's COT data).
+// symbols like XAUUSD or EURUSD would trip that, so the library is only reached when COT is
+// enabled AND the chart is a futures symbol (or a manual CFTC code is given, which skips the
+// lookup). Both the lookup and the two data requests sit inside this `if`.
+// For gold COT data, chart COMEX:GC1! or COMEX_MINI:MGC1! instead of XAUUSD.
+bool  cotOn    = enableCOT and (cftcOverride != "" or syminfo.type == "futures")
 float cotNet   = na
 float cotIndex = na
-if enableCOT
+if cotOn
     string cftcCode = cftcOverride != "" ? cftcOverride : cot.getCFTCCode(syminfo.tickerid)
     float specLong  = cot.requestCommitmentOfTraders(reportType, cftcCode, includeOptions, longMetric, "Long", "All")
     float specShort = cot.requestCommitmentOfTraders(reportType, cftcCode, includeOptions, longMetric, "Short", "All")
@@ -924,6 +936,14 @@ var int mtfLastLtfT = 0
 var int mtfLtfMissing = 0
 
 // ============================= MTF ENGINE: DISPLAY INPUTS =============================
+// `mtfDisplay` ("Clean" / "Standard" / "Full") is declared by the host script, before this block.
+// Display gates act where objects are CREATED, so hidden objects are never created.
+bool   mtfModeClean = mtfDisplay == "Clean"
+bool   mtfModeFull  = mtfDisplay == "Full"
+string mtfMinGrade  = input.string("A", "Show zones with quality grade >=", options = ["A", "A+"], tooltip = "Quality grade = how many of 4 checks pass (Overlap, Trend, Location, Zone sweep). A+ = 4/4, A = 3/4, B = 2/4 or less (only shown in Full mode). A grade describes context; it is not a probability.", group = "Buy / Sell Zones")
+int    mtfNearestN  = input.int(2, "Zones per side (nearest to price)", minval = 1, maxval = 10, tooltip = "Ignored in Full mode (all graded zones shown).", group = "Buy / Sell Zones")
+float  mtfSweepTol  = input.float(0.25, "Zone sweep tolerance below/above zone (x ATR14)", minval = 0.0, step = 0.05, tooltip = "A sweep counts for a zone only if the sweep candle's wick reached into the zone or within this distance beyond it.", group = "Buy / Sell Zones")
+bool   mtfDiag      = input.bool(false, "Grade diagnostics (show each check on the label)", group = "Buy / Sell Zones")
 color mtfBullCol    = input.color(color.new(color.teal, 82), "Bullish zone", inline = "zc", group = "MTF Display")
 color mtfBearCol    = input.color(color.new(color.red, 82), "Bearish zone", inline = "zc", group = "MTF Display")
 int   mtfMaxZones   = input.int(12, "Max active zones per layer", minval = 1, maxval = 60, tooltip = "Oldest zone is dropped (validity = Dropped) once exceeded.", group = "MTF Display")
@@ -961,6 +981,10 @@ type MtfZone
     bool   setupLive      = false
     float  relVol         = na
     string lastSetup      = ""
+    int    sweptBar       = na
+    string grade          = ""
+    string checks         = ""
+    bool   aplusAlerted   = false
     box    bx             = na
     line   ce             = na
     label  lb             = na
@@ -1006,6 +1030,8 @@ type MtfSetup
     bool    fDisp           = false
     bool    fCE             = false
     string  session         = ""
+    string  grade           = ""
+    string  period          = ""
 
 // Layers: 0 = LTF, 1 = chart TF, 2 = HTF.
 var array<MtfZone>  mtfZonesL = array.new<MtfZone>()
@@ -1016,8 +1042,9 @@ var array<MtfSwing> mtfSwC    = array.new<MtfSwing>()
 var array<MtfSwing> mtfSwH    = array.new<MtfSwing>()
 var array<int>      mtfIdCtr  = array.from(0)
 
+// Raw zone/swing layers: HTF from Standard up, chart-TF and LTF only in Full.
 mtf_layerShow(int layer) =>
-    layer == 2 ? mtfShowHtf : layer == 1 ? mtfShowCtf : mtfShowLtf
+    layer == 2 ? mtfShowHtf and not mtfModeClean : layer == 1 ? mtfShowCtf and mtfModeFull : mtfShowLtf and mtfModeFull
 
 mtf_kill(MtfZone z) =>
     if not na(z.bx)
@@ -1178,7 +1205,7 @@ if barstate.islast
     mtf_extendRight(mtfZonesH, mtfSwH)
     mtf_extendRight(mtfZonesC, mtfSwC)
     mtf_extendRight(mtfZonesL, mtfSwL)
-    if mtfShowDev and mtfHtfOn
+    if mtfShowDev and mtfHtfOn and mtfModeFull
         color devC = color.new(color.gray, 30)
         if not na(dBFT)
             array.push(mtfDevBoxes, box.new(dFT, dBFT, time, dBFB, xloc = xloc.bar_time, border_color = devC, border_style = line.style_dashed, bgcolor = color.new(color.gray, 100), text = mtfHtfName + " FVG (developing)", text_size = size.tiny, text_color = devC))
@@ -1193,16 +1220,12 @@ mtf_zoneTxt(MtfZone z) =>
     na(z) ? "none" : "#" + str.tostring(z.id) + " " + z.tf + " " + z.kind + (z.dir == 1 ? " bull" : " bear") + ": " + z.validity + ", touches " + str.tostring(z.touchCount) + (z.ceTouched ? ", CE hit" : "") + (z.filled ? ", filled" : "")
 
 // ============================= MTF ENGINE: AREA OF INTEREST (context, not an entry) =============================
-// An AOI only says WHERE to pay attention. It never fires a trade by itself: a setup also needs
-// a Trigger (Phase 4) and must pass the Risk gate. Confluence is shown as 4 categories instead
-// of a point count, so correlated facts aren't double-counted:
-//   L = Location   price is inside the AOI (gate)          + Disc/Prem of the HTF dealing range (info)
-//   S = Structure  HTF structure direction == AOI direction (one flag; chart BOS not counted again)
-//   T = Trigger    a setup on this AOI has triggered
-//   R = Risk       that setup passed the cost-adjusted reward:risk gate
+// An AOI (shown on the chart as a BUY / SELL ZONE) only says WHERE to pay attention. It never
+// fires a trade by itself: a setup also needs a Trigger and must pass the Risk gate. How good the
+// context is, is the zone's quality grade (see QUALITY GRADE below); whether a trade is actually
+// on is the setup status. The two are kept separate.
 string mtfAoiMode  = input.string("HTF zone", "AOI definition", options = ["HTF zone", "HTF zone ∩ lower-TF zone"], tooltip = "HTF zone: any Active HTF OB/FVG is an AOI. Intersection: only the part of an HTF zone that overlaps an Active same-direction chart-TF or LTF zone. Frozen across models A-F.", group = "MTF Setups")
-bool   mtfShowAoi  = input.bool(true, "Show AOI boxes", group = "MTF Setups")
-bool   mtfShowPD   = input.bool(true, "Show Premium / Discount of HTF dealing range", group = "MTF Setups")
+bool   mtfShowPD   = input.bool(true, "Show Premium / Discount of HTF dealing range (Standard/Full)", group = "MTF Setups")
 
 // A zone qualifies as an AOI source if it is an HTF zone that is still valid.
 mtf_isAoiZone(MtfZone z, bool flipAoi) =>
@@ -1233,33 +1256,19 @@ float mtfEq = na(mtfRgHi) or na(mtfRgLo) ? na : (mtfRgHi + mtfRgLo) / 2
 mtf_pdTxt(float px) =>
     na(mtfEq) ? "P/D n/a" : px < mtfEq ? "Disc" : px > mtfEq ? "Prem" : "EQ"
 
-var array<box>   mtfAoiBoxes = array.new<box>()
 var array<box>   mtfPdBoxes  = array.new<box>()
 var array<line>  mtfPdLines  = array.new<line>()
 
-mtf_drawAoiAndPD() =>
-    for b in mtfAoiBoxes
-        box.delete(b)
-    array.clear(mtfAoiBoxes)
+// Premium / Discount context (Standard and Full modes). Buy/Sell Zone boxes are drawn by
+// mtf_drawZones() further down, after grading.
+mtf_drawPD() =>
     for b in mtfPdBoxes
         box.delete(b)
     array.clear(mtfPdBoxes)
     for l in mtfPdLines
         line.delete(l)
     array.clear(mtfPdLines)
-    if mtfShowAoi
-        for z in mtfZonesH
-            if mtf_isAoiZone(z, mtfFlipAOI)
-                [ok, aTop, aBot] = mtf_aoi(z, mtfAoiMode)
-                if ok
-                    bool   inL  = high >= aBot and low <= aTop
-                    bool   inS  = mtfHtfTrend == z.dir
-                    bool   inT  = z.lastSetup == "Triggered" or z.lastSetup == "Open" or z.lastSetup == "Closed"
-                    string rTxt = inT ? "✓" : z.lastSetup == "Rejected:risk" ? "✗" : "–"
-                    color  c    = z.dir == 1 ? color.green : color.red
-                    string txt  = (z.dir == 1 ? "BUY AOI " : "SELL AOI ") + z.tf + " " + z.kind + " · L" + (inL ? "✓" : "–") + " S" + (inS ? "✓" : "–") + " T" + (inT ? "✓" : "–") + " R" + rTxt + " · " + mtf_pdTxt((aTop + aBot) / 2)
-                    array.push(mtfAoiBoxes, box.new(z.originTime, aTop, time, aBot, xloc = xloc.bar_time, extend = extend.right, border_color = color.new(c, 10), border_width = 2, bgcolor = color.new(c, 88), text = txt, text_size = size.small, text_color = color.new(c, 0), text_halign = text.align_right, text_valign = z.dir == 1 ? text.align_bottom : text.align_top))
-    if mtfShowPD and not na(mtfEq)
+    if mtfShowPD and not mtfModeClean and not na(mtfEq)
         int leftT = time[math.min(bar_index, 50)]
         array.push(mtfPdBoxes, box.new(leftT, mtfRgHi, time, mtfEq, xloc = xloc.bar_time, extend = extend.right, border_width = 0, bgcolor = color.new(color.red, 94), text = mtfHtfName + " Premium", text_size = size.tiny, text_color = color.new(color.red, 40), text_halign = text.align_left, text_valign = text.align_top))
         array.push(mtfPdBoxes, box.new(leftT, mtfEq, time, mtfRgLo, xloc = xloc.bar_time, extend = extend.right, border_width = 0, bgcolor = color.new(color.green, 94), text = mtfHtfName + " Discount", text_size = size.tiny, text_color = color.new(color.green, 40), text_halign = text.align_left, text_valign = text.align_bottom))
@@ -1340,8 +1349,11 @@ type MtfStats
     array<float> flagR
     array<int>   sessN
     array<float> sessR
+    array<int>   gN
+    array<int>   gW
+    array<float> gR
 
-var MtfStats mtfSt = MtfStats.new(flagN = array.new<int>(10, 0), flagR = array.new<float>(10, 0.0), sessN = array.new<int>(4, 0), sessR = array.new<float>(4, 0.0))
+var MtfStats mtfSt = MtfStats.new(flagN = array.new<int>(10, 0), flagR = array.new<float>(10, 0.0), sessN = array.new<int>(4, 0), sessR = array.new<float>(4, 0.0), gN = array.new<int>(6, 0), gW = array.new<int>(6, 0), gR = array.new<float>(6, 0.0))
 var array<MtfSetup> mtfSetups = array.new<MtfSetup>()
 var int mtfSetupCtr = 0
 var array<label> mtfMarks = array.new<label>()
@@ -1362,11 +1374,18 @@ mtf_num(float v) =>
 
 // One CSV line per terminal setup state in Pine Logs (copy out for offline analysis).
 // Columns: id,dir,state,reason,zone,trigTime,entry,stop,target,exit,R,holdBars,MAE_R,MFE_R,
-//          ambiguous,fStruct,fSweep,fPD,fDisp,fCE,session
+//          ambiguous,fStruct,fSweep,fPD,fDisp,fCE,session,grade,period
 mtf_log(MtfSetup s) =>
     string tt = na(s.trigTime) ? "" : str.format_time(s.trigTime, "yyyy-MM-dd HH:mm", "America/New_York")
     string hold = na(s.exitBar) or na(s.entryBar) ? "" : str.tostring(s.exitBar - s.entryBar + 1)
-    log.info("SETUP," + str.tostring(s.id) + "," + (s.dir == 1 ? "long" : "short") + "," + s.state + "," + s.reason + "," + s.z.tf + " " + s.z.kind + "," + tt + "," + mtf_num(s.entry) + "," + mtf_num(s.stop) + "," + mtf_num(s.target) + "," + mtf_num(s.exitPrice) + "," + mtf_num(s.rMult) + "," + hold + "," + mtf_num(s.mae) + "," + mtf_num(s.mfe) + "," + str.tostring(s.ambiguous) + "," + str.tostring(s.fStruct) + "," + str.tostring(s.fSweep) + "," + str.tostring(s.fPD) + "," + str.tostring(s.fDisp) + "," + str.tostring(s.fCE) + "," + s.session)
+    log.info("SETUP," + str.tostring(s.id) + "," + (s.dir == 1 ? "long" : "short") + "," + s.state + "," + s.reason + "," + s.z.tf + " " + s.z.kind + "," + tt + "," + mtf_num(s.entry) + "," + mtf_num(s.stop) + "," + mtf_num(s.target) + "," + mtf_num(s.exitPrice) + "," + mtf_num(s.rMult) + "," + hold + "," + mtf_num(s.mae) + "," + mtf_num(s.mfe) + "," + str.tostring(s.ambiguous) + "," + str.tostring(s.fStruct) + "," + str.tostring(s.fSweep) + "," + str.tostring(s.fPD) + "," + str.tostring(s.fDisp) + "," + str.tostring(s.fCE) + "," + s.session + "," + s.grade + "," + s.period)
+
+mtf_gradeIdx(string g) =>
+    g == "A+" ? 0 : g == "A" ? 1 : 2
+
+// Grade g passes the display minimum (Full mode shows every grade).
+mtf_gradeShown(string g) =>
+    mtfModeFull or g == "A+" or (g == "A" and mtfMinGrade == "A")
 
 mtf_record(MtfStats st, MtfSetup s) =>
     float r = s.rMult
@@ -1393,6 +1412,11 @@ mtf_record(MtfStats st, MtfSetup s) =>
     int si = s.session == "London" ? 0 : s.session == "NY AM" ? 1 : s.session == "NY PM" ? 2 : 3
     array.set(st.sessN, si, array.get(st.sessN, si) + 1)
     array.set(st.sessR, si, array.get(st.sessR, si) + r)
+    // Per quality grade (at trigger) x period (IS / OOS by trigger time vs the split date).
+    int gi = mtf_gradeIdx(s.grade) * 2 + (s.period == "OOS" ? 1 : 0)
+    array.set(st.gN, gi, array.get(st.gN, gi) + 1)
+    array.set(st.gW, gi, array.get(st.gW, gi) + (r > 0 ? 1 : 0))
+    array.set(st.gR, gi, array.get(st.gR, gi) + r)
 
 mtf_close(MtfStats st, MtfSetup s, float exitPx, string why, bool limitExit) =>
     s.state     := "Closed"
@@ -1405,7 +1429,7 @@ mtf_close(MtfStats st, MtfSetup s, float exitPx, string why, bool limitExit) =>
     zz.lastSetup := "Closed"
     mtf_record(st, s)
     mtf_log(s)
-    if mtfShowTrades
+    if mtfShowTrades and mtf_gradeShown(s.grade)
         mtf_lvl(line.new(s.entryBar, s.stop, bar_index, s.stop, color = color.new(color.red, 20), style = line.style_dashed))
         mtf_lvl(line.new(s.entryBar, s.target, bar_index, s.target, color = color.new(color.teal, 20), style = line.style_dashed))
         mtf_mark(label.new(bar_index, exitPx, str.tostring(s.rMult, "+#.##;-#.##") + "R " + why, style = label.style_label_left, color = color.new(color.black, 100), textcolor = s.rMult > 0 ? color.teal : color.maroon, size = size.tiny))
@@ -1433,6 +1457,7 @@ int   mtfSigDir    = 0
 int   mtfSigId     = na
 float mtfSigStop   = na
 float mtfSigTarget = na
+string mtfSigGrade = ""
 int   mtfArmDir    = 0
 int   mtfTimeExitId = na
 
@@ -1486,19 +1511,19 @@ if barstate.isconfirmed
         mtfEqLo := na
     if not na(mtfEqHi) and high > mtfEqHi and close < mtfEqHi
         mtfBearEqSwpBar := bar_index
-        if mtfShowTrades and mtfXEq
+        if mtfShowTrades and mtfXEq and mtfModeFull
             mtf_mark(label.new(bar_index, high, "EQH sweep", style = label.style_label_down, color = color.new(color.black, 100), textcolor = color.maroon, size = size.tiny))
         mtfEqHi := na
     if not na(mtfEqLo) and low < mtfEqLo and close > mtfEqLo
         mtfBullEqSwpBar := bar_index
-        if mtfShowTrades and mtfXEq
+        if mtfShowTrades and mtfXEq and mtfModeFull
             mtf_mark(label.new(bar_index, low, "EQL sweep", style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.teal, size = size.tiny))
         mtfEqLo := na
     if not na(cPH)
         if not na(mtfPrevPH) and bar_index - mtfPrevPHBar <= mtfEqExpiry and math.abs(cPH - mtfPrevPH) <= mtfEqAtr * mtfAtr
             mtfEqHi    := math.max(cPH, mtfPrevPH)
             mtfEqHiBar := bar_index
-            if mtfShowTrades and mtfXEq
+            if mtfShowTrades and mtfXEq and mtfModeFull
                 mtf_lvl(line.new(bar_index - mtfPivLen, mtfEqHi, bar_index, mtfEqHi, color = color.new(color.maroon, 30), style = line.style_dotted))
         mtfPrevPH    := cPH
         mtfPrevPHBar := bar_index
@@ -1506,7 +1531,7 @@ if barstate.isconfirmed
         if not na(mtfPrevPL) and bar_index - mtfPrevPLBar <= mtfEqExpiry and math.abs(cPL - mtfPrevPL) <= mtfEqAtr * mtfAtr
             mtfEqLo    := math.min(cPL, mtfPrevPL)
             mtfEqLoBar := bar_index
-            if mtfShowTrades and mtfXEq
+            if mtfShowTrades and mtfXEq and mtfModeFull
                 mtf_lvl(line.new(bar_index - mtfPivLen, mtfEqLo, bar_index, mtfEqLo, color = color.new(color.teal, 30), style = line.style_dotted))
         mtfPrevPL    := cPL
         mtfPrevPLBar := bar_index
@@ -1532,11 +1557,144 @@ if barstate.islast
     for b in mtfOteBoxes
         box.delete(b)
     array.clear(mtfOteBoxes)
-    if mtfShowOte and not na(mtfRgHi) and not na(mtfRgLo) and mtfRgHi > mtfRgLo and mtfHtfTrend != 0
+    if mtfShowOte and not mtfModeClean and not na(mtfRgHi) and not na(mtfRgLo) and mtfRgHi > mtfRgLo and mtfHtfTrend != 0
         float rng = mtfRgHi - mtfRgLo
         float oT = mtfHtfTrend == 1 ? mtfRgHi - mtfOteLo * rng : mtfRgLo + mtfOteHi * rng
         float oB = mtfHtfTrend == 1 ? mtfRgHi - mtfOteHi * rng : mtfRgLo + mtfOteLo * rng
         array.push(mtfOteBoxes, box.new(time[math.min(bar_index, 30)], oT, time, oB, xloc = xloc.bar_time, extend = extend.right, border_color = color.new(color.purple, 40), border_style = line.style_dashed, bgcolor = color.new(color.purple, 92), text = mtfHtfName + " OTE", text_size = size.tiny, text_color = color.new(color.purple, 20), text_halign = text.align_left))
+
+// ============================= MTF ENGINE: QUALITY GRADE (A+ / A / B) =============================
+// Grades each valid HTF zone (a Buy/Sell Zone candidate) with 4 checks, using only what is known
+// on the current closed bar. A grade describes CONTEXT, not a probability, and is kept separate
+// from setup status (Waiting / Armed / In trade / ...) and from historical results.
+//   Overlap   a valid same-direction chart-TF or LTF OB/FVG overlaps the zone now
+//   Trend     HTF structure trend points the zone's way now
+//   Location  zone midpoint in Discount (buy) / Premium (sell) of the current HTF dealing range
+//   Sweep     a liquidity sweep in the zone's direction happened AT this zone (wick into it, or
+//             within mtfSweepTol x ATR beyond it), after the zone was confirmed, within the
+//             last mtfSweepBars bars. Sweeps elsewhere on the chart don't count.
+// A+ = 4/4, A = 3/4, B = 2/4 or less. Recomputed every closed bar; past bars are never revised.
+mtf_grade(MtfZone z) =>
+    [ovOk, ovTop, ovBot] = mtf_aoi(z, "HTF zone ∩ lower-TF zone")
+    bool  cTr  = mtfHtfTrend == z.dir
+    float mid  = (z.top + z.bot) / 2
+    bool  cLoc = not na(mtfEq) and (z.dir == 1 ? mid < mtfEq : mid > mtfEq)
+    bool  cSw  = mtf_recent(z.sweptBar, mtfSweepBars)
+    int   sc   = (ovOk ? 1 : 0) + (cTr ? 1 : 0) + (cLoc ? 1 : 0) + (cSw ? 1 : 0)
+    string g   = sc == 4 ? "A+" : sc == 3 ? "A" : "B"
+    string chk = "Overlap " + (ovOk ? "✓" : "✗") + "  Trend " + (cTr ? "✓" : "✗") + "  " + (z.dir == 1 ? "Discount " : "Premium ") + (cLoc ? "✓" : "✗") + "  Sweep " + (cSw ? "✓" : "✗")
+    [sc, g, chk]
+
+int mtfAplusDir = 0   // a zone became A+ on this bar (for alerts)
+
+if barstate.isconfirmed
+    bool bullSwp = mtfBullSwpBar == bar_index
+    bool bearSwp = mtfBearSwpBar == bar_index
+    for z in mtfZonesH
+        if mtf_isAoiZone(z, mtfFlipAOI)
+            if z.confirmTime < time
+                float tol = mtfSweepTol * mtfAtr
+                if bullSwp and z.dir == 1 and low <= z.top and low >= z.bot - tol
+                    z.sweptBar := bar_index
+                if bearSwp and z.dir == -1 and high >= z.bot and high <= z.top + tol
+                    z.sweptBar := bar_index
+            [sc, g, chk] = mtf_grade(z)
+            if g == "A+" and z.grade != "A+" and not z.aplusAlerted and mtf_gradeShown("A+")
+                z.aplusAlerted := true
+                mtfAplusDir := z.dir
+            z.grade  := g
+            z.checks := chk
+
+// ============================= MTF ENGINE: BUY / SELL ZONE DISPLAY =============================
+// Historical results per grade. Population = setups closed by this engine on THIS chart load,
+// i.e. this symbol, chart TF, model, trigger, exits and ledger costs only -- nothing pooled from
+// other settings. Grade = the zone's grade on the setup's TRIGGER bar.
+//   win rate = winning closed trades / all closed trades of that grade (rounded %)
+//   avg R    = mean net R per closed trade, costs included; a bar touching stop and target = loss
+// Out-of-sample stats (trigger on/after the IS/OOS split) are shown once there are >= 20 of them;
+// until then in-sample stats are shown and labelled. Past results, not the next trade's odds.
+mtf_gradeStatTxt(string g) =>
+    int   gi   = mtf_gradeIdx(g) * 2
+    bool  useO = array.get(mtfSt.gN, gi + 1) >= 20
+    int   k    = useO ? gi + 1 : gi
+    int   n    = array.get(mtfSt.gN, k)
+    int   w    = array.get(mtfSt.gW, k)
+    float r    = array.get(mtfSt.gR, k)
+    n == 0 ? "no past " + g + " trades yet" : "won " + str.tostring(math.round(100.0 * w / n)) + "% of " + str.tostring(n) + " · avg " + str.tostring(r / n, "+0.00;-0.00") + "R · " + (useO ? "out-of-sample" : "in-sample") + (n < 20 ? " · low sample" : "")
+
+// Setup status of a zone, from the setup lifecycle (separate from its grade).
+mtf_status(MtfZone z) =>
+    string ls = z.lastSetup
+    ls == "Armed" ? "Armed" : ls == "Triggered" or ls == "Open" ? "In trade" : ls == "Closed" ? "Traded" : ls == "Expired" ? "Expired" : str.startswith(ls, "Rejected") ? "Rejected" : "Waiting"
+
+mtf_statusRank(string st) =>
+    st == "In trade" ? 4 : st == "Armed" ? 3 : st == "Expired" or st == "Rejected" ? 2 : st == "Traded" ? 1 : 0
+
+// Display-only grouping: overlapping zones with the SAME direction and SAME grade are drawn as
+// one box. Setups and stats stay attributed to each individual zone.
+type MtfGroup
+    int    dir
+    string grade
+    float  top
+    float  bot
+    int    left
+    string members
+    string status
+    int    statusRank
+    bool   touching
+    string checks
+
+var array<box>    mtfZoneBoxes = array.new<box>()
+var array<string> mtfNearTxt   = array.from("none", "none")
+
+mtf_drawZones() =>
+    for b in mtfZoneBoxes
+        box.delete(b)
+    array.clear(mtfZoneBoxes)
+    array.set(mtfNearTxt, 0, "none")
+    array.set(mtfNearTxt, 1, "none")
+    array<MtfGroup> groups = array.new<MtfGroup>()
+    for z in mtfZonesH
+        if mtf_isAoiZone(z, mtfFlipAOI) and z.grade != "" and mtf_gradeShown(z.grade)
+            string st = mtf_status(z)
+            int    rk = mtf_statusRank(st)
+            bool   merged = false
+            for g in groups
+                if not merged and g.dir == z.dir and g.grade == z.grade and z.bot <= g.top and z.top >= g.bot
+                    g.top      := math.max(g.top, z.top)
+                    g.bot      := math.min(g.bot, z.bot)
+                    g.left     := math.min(g.left, z.originTime)
+                    g.members  := g.members + " + " + z.kind
+                    g.touching := g.touching or z.inside
+                    if rk > g.statusRank
+                        g.status     := st
+                        g.statusRank := rk
+                    merged := true
+            if not merged
+                array.push(groups, MtfGroup.new(z.dir, z.grade, z.top, z.bot, z.originTime, z.tf + " " + z.kind, st, rk, z.inside, z.checks))
+    // Rank per side by distance from the close to the zone's nearest edge; a zone price is
+    // inside has distance 0 and ranks first.
+    for side = 0 to 1
+        int d = side == 0 ? 1 : -1
+        array<MtfGroup> sideG = array.new<MtfGroup>()
+        array<float>    dists = array.new<float>()
+        for g in groups
+            if g.dir == d
+                array.push(sideG, g)
+                array.push(dists, close >= g.bot and close <= g.top ? 0.0 : math.min(math.abs(close - g.top), math.abs(close - g.bot)))
+        int nG = array.size(sideG)
+        if nG > 0
+            array<int> idx = array.sort_indices(dists, order.ascending)
+            int lim = mtfModeFull ? nG : math.min(mtfNearestN, nG)
+            for j = 0 to lim - 1
+                MtfGroup g = array.get(sideG, array.get(idx, j))
+                bool   ap  = g.grade == "A+"
+                color  c   = g.dir == 1 ? color.green : color.red
+                int    tr  = (ap ? 78 : g.grade == "A" ? 88 : 93) - (g.touching ? 10 : 0)
+                string txt = g.grade + (g.dir == 1 ? " BUY ZONE" : " SELL ZONE") + " · " + g.status + " · " + g.members + "\n" + mtf_gradeStatTxt(g.grade) + (mtfDiag ? "\n" + g.checks : "")
+                array.push(mtfZoneBoxes, box.new(g.left, g.top, time, g.bot, xloc = xloc.bar_time, extend = extend.right, border_color = color.new(c, ap ? 0 : 40), border_width = g.status == "In trade" ? 3 : ap ? 2 : 1, bgcolor = color.new(c, tr), text = txt, text_size = size.small, text_color = color.new(c, 0), text_halign = text.align_right, text_valign = text.align_center))
+                if j == 0
+                    array.set(mtfNearTxt, side, g.grade + " " + g.status + "  " + str.tostring(g.bot, format.mintick) + " – " + str.tostring(g.top, format.mintick))
 
 // ============================= MTF ENGINE: MODELS (ablation ladder) =============================
 // Each feature enters the cumulative ladder exactly once; "A+X" runs add ONE filter to the
@@ -1544,12 +1702,13 @@ if barstate.islast
 //   A: T0 only | B: +Struct | C: +Sweep | D: +P/D | E: +Disp | F: +CE
 // Zone definitions, AOI, trigger, stop, target, costs, sizing, session and window are identical.
 string mtfModel = input.string("A", "Model", options = ["A", "B", "C", "D", "E", "F", "A+Struct", "A+Sweep", "A+PD", "A+Disp", "A+CE"], tooltip = "A = baseline T0. B = A + HTF structure aligned. C = B + chart-TF liquidity sweep. D = C + Discount (long) / Premium (short). E = D + displacement trigger candle. F = E + AOI CE touched. A+X = baseline plus one filter.", group = "MTF Model")
+string mtfTradeGrade = input.string("All", "Research: trade only grade >=", options = ["All", "A", "A+"], tooltip = "Separate experiment, NOT part of the A-F ladder: the grade already contains Struct, P/D and a sweep, so combining it with models B-F double-counts them. Compare against Model A with this set to All.", group = "MTF Model")
 bool mtfUseStruct = mtfModel == "B" or mtfModel == "C" or mtfModel == "D" or mtfModel == "E" or mtfModel == "F" or mtfModel == "A+Struct"
 bool mtfUseSweep  = mtfModel == "C" or mtfModel == "D" or mtfModel == "E" or mtfModel == "F" or mtfModel == "A+Sweep"
 bool mtfUsePD     = mtfModel == "D" or mtfModel == "E" or mtfModel == "F" or mtfModel == "A+PD"
 bool mtfUseDisp   = mtfModel == "E" or mtfModel == "F" or mtfModel == "A+Disp"
 bool mtfUseCE     = mtfModel == "F" or mtfModel == "A+CE"
-string mtfModelTxt = mtfModel + " [" + (mtfUseStruct ? "Struct " : "") + (mtfUseSweep ? "Sweep " : "") + (mtfUsePD ? "PD " : "") + (mtfUseDisp ? "Disp " : "") + (mtfUseCE ? "CE " : "") + (mtfXEq ? "+EQ " : "") + (mtfXOte ? "+OTE " : "") + (mtfXVol ? "+RelVol " : "") + (mtfFlipAOI ? "+FlipAOI " : "") + (mtfTrigMode == "T0 reaction close" ? "T0" : "T1") + "]"
+string mtfModelTxt = mtfModel + " [" + (mtfUseStruct ? "Struct " : "") + (mtfUseSweep ? "Sweep " : "") + (mtfUsePD ? "PD " : "") + (mtfUseDisp ? "Disp " : "") + (mtfUseCE ? "CE " : "") + (mtfXEq ? "+EQ " : "") + (mtfXOte ? "+OTE " : "") + (mtfXVol ? "+RelVol " : "") + (mtfFlipAOI ? "+FlipAOI " : "") + (mtfTradeGrade != "All" ? "+Grade>=" + mtfTradeGrade + " " : "") + (mtfTrigMode == "T0 reaction close" ? "T0" : "T1") + "]"
 
 // Records every feature fact on the setup, then applies the model filters and research toggles.
 // Returns "" if the setup passes, else the name of the first failing requirement.
@@ -1561,8 +1720,9 @@ mtf_filterFail(MtfSetup s) =>
     s.fCE     := s.z.ceTouched
     bool eqOk  = not mtfXEq or (s.dir == 1 ? mtf_recent(mtfBullEqSwpBar, mtfSweepBars) : mtf_recent(mtfBearEqSwpBar, mtfSweepBars))
     bool oteOk = not mtfXOte or mtf_inOte(close, s.dir)
+    bool grOk  = mtfTradeGrade == "All" or s.grade == "A+" or (mtfTradeGrade == "A" and s.grade == "A")
     bool volOk = not mtfXVol or not (s.z.kind == "OB" or s.z.kind == "Breaker") or (not na(s.z.relVol) and s.z.relVol >= mtfMinRelVol)
-    mtfUseStruct and not s.fStruct ? "Struct" : mtfUseSweep and not s.fSweep ? "Sweep" : mtfUsePD and not s.fPD ? "PD" : mtfUseDisp and not s.fDisp ? "Disp" : mtfUseCE and not s.fCE ? "CE" : not eqOk ? "EQsweep" : not oteOk ? "OTE" : not volOk ? "RelVol" : ""
+    mtfUseStruct and not s.fStruct ? "Struct" : mtfUseSweep and not s.fSweep ? "Sweep" : mtfUsePD and not s.fPD ? "PD" : mtfUseDisp and not s.fDisp ? "Disp" : mtfUseCE and not s.fCE ? "CE" : not eqOk ? "EQsweep" : not oteOk ? "OTE" : not volOk ? "RelVol" : not grOk ? "Grade" : ""
 
 if barstate.isconfirmed
     // ---- 1) fills and exits of setups already in flight ----
@@ -1611,7 +1771,8 @@ if barstate.isconfirmed
                     z.lastSetup  := "Armed"
                     array.push(mtfSetups, MtfSetup.new(id = mtfSetupCtr, z = z, dir = z.dir, aoiTop = aTop, aoiBot = aBot, armBar = bar_index))
                     mtfSt.nArmed += 1
-                    mtfArmDir := z.dir
+                    if mtf_gradeShown(z.grade)
+                        mtfArmDir := z.dir
     // ---- 3) armed setups: cancel / trigger / expire ----
     bool busy = false
     for s in mtfSetups
@@ -1626,6 +1787,8 @@ if barstate.isconfirmed
                 s.trigTime  := time
                 s.trigClose := close
                 s.session   := mtf_sessBucket(time)
+                s.grade     := s.z.grade
+                s.period    := time >= mtfSplitT ? "OOS" : "IS"
                 s.stop      := s.dir == 1 ? s.aoiBot - mtfStopBuf * mtfAtr : s.aoiTop + mtfStopBuf * mtfAtr
                 float risk  = s.dir == 1 ? close - s.stop : s.stop - close
                 s.target    := s.dir == 1 ? close + mtfTargetR * risk : close - mtfTargetR * risk
@@ -1647,8 +1810,9 @@ if barstate.isconfirmed
                     mtfSigId     := s.id
                     mtfSigStop   := s.stop
                     mtfSigTarget := s.target
-                    if mtfShowTrades
-                        mtf_mark(label.new(bar_index, s.dir == 1 ? low : high, (s.dir == 1 ? "▲ BUY #" : "▼ SELL #") + str.tostring(s.id), style = s.dir == 1 ? label.style_label_up : label.style_label_down, color = s.dir == 1 ? color.teal : color.maroon, textcolor = color.white, size = size.small))
+                    mtfSigGrade  := s.grade
+                    if mtfShowTrades and mtf_gradeShown(s.grade)
+                        mtf_mark(label.new(bar_index, s.dir == 1 ? low : high, (s.dir == 1 ? "▲ BUY " : "▼ SELL ") + s.grade + " #" + str.tostring(s.id), style = s.dir == 1 ? label.style_label_up : label.style_label_down, color = s.dir == 1 ? color.teal : color.maroon, textcolor = color.white, size = size.small))
             else if bar_index - s.armBar + 1 >= mtfTrigWin
                 mtf_end(mtfSt, s, "Expired", "no trigger")
     // ---- 4) drop finished setups; keep stop/target lines of open trades stretched ----
@@ -1662,102 +1826,93 @@ if barstate.isconfirmed
 // Open trade: temporary stop/target lines up to the current bar.
 var array<line> mtfOpenLvls = array.new<line>()
 if barstate.islast
-    mtf_drawAoiAndPD()
+    mtf_drawPD()
+    mtf_drawZones()
     for l in mtfOpenLvls
         line.delete(l)
     array.clear(mtfOpenLvls)
     if mtfShowTrades
         for s in mtfSetups
-            if s.state == "Open"
+            if s.state == "Open" and mtf_gradeShown(s.grade)
                 array.push(mtfOpenLvls, line.new(s.entryBar, s.stop, bar_index, s.stop, color = color.new(color.red, 20), style = line.style_dashed))
                 array.push(mtfOpenLvls, line.new(s.entryBar, s.target, bar_index, s.target, color = color.new(color.teal, 20), style = line.style_dashed))
 
 // ==== ENGINE END (keep in sync) ====
 
-// ============================= MTF ALERTS =============================
-// Each setup changes state once, on a closed bar, so each alert fires once per setup ID.
+// ============================= ALERTS =============================
+// Engine state changes once, on a closed bar, so each alert fires once per event. Only zones and
+// setups whose quality grade passes "Show zones with quality grade >=" raise alerts.
+if mtfAplusDir != 0
+    alert((mtfAplusDir == 1 ? "A+ BUY ZONE" : "A+ SELL ZONE") + " on " + syminfo.ticker + " " + mtfCtfName + ": all 4 quality checks pass (context only -- wait for the trigger)", alert.freq_once_per_bar_close)
 if mtfArmDir != 0
-    alert((mtfArmDir == 1 ? "Price entered a BUY AOI (" : "Price entered a SELL AOI (") + syminfo.ticker + ") -- waiting for trigger", alert.freq_once_per_bar_close)
-if mtfSigDir != 0
-    alert((mtfSigDir == 1 ? "BUY" : "SELL") + " setup #" + str.tostring(mtfSigId) + " triggered on " + syminfo.ticker + ": entry next open, stop " + str.tostring(mtfSigStop, format.mintick) + ", target " + str.tostring(mtfSigTarget, format.mintick), alert.freq_once_per_bar_close)
-alertcondition(mtfSigDir == 1, "MTF BUY setup triggered", "MTF BUY setup triggered -- entry next bar open")
-alertcondition(mtfSigDir == -1, "MTF SELL setup triggered", "MTF SELL setup triggered -- entry next bar open")
-alertcondition(mtfArmDir != 0, "Price entered an AOI", "Price entered an MTF Buy/Sell AOI")
+    alert("Price entered a " + (mtfArmDir == 1 ? "BUY" : "SELL") + " ZONE on " + syminfo.ticker + " " + mtfCtfName + " -- setup Armed, waiting for trigger", alert.freq_once_per_bar_close)
+if mtfSigDir != 0 and mtf_gradeShown(mtfSigGrade)
+    alert(mtfSigGrade + (mtfSigDir == 1 ? " BUY" : " SELL") + " setup #" + str.tostring(mtfSigId) + " triggered on " + syminfo.ticker + " " + mtfCtfName + ": entry next open, stop " + str.tostring(mtfSigStop, format.mintick) + ", target " + str.tostring(mtfSigTarget, format.mintick), alert.freq_once_per_bar_close)
+alertcondition(mtfAplusDir != 0, "A+ zone formed", "An MTF Buy/Sell Zone reached quality grade A+")
+alertcondition(mtfArmDir != 0, "Price entered a Buy/Sell Zone", "Price entered an MTF Buy/Sell Zone -- setup Armed")
+alertcondition(mtfSigDir == 1 and mtf_gradeShown(mtfSigGrade), "BUY setup triggered", "MTF BUY setup triggered -- entry next bar open")
+alertcondition(mtfSigDir == -1 and mtf_gradeShown(mtfSigGrade), "SELL setup triggered", "MTF SELL setup triggered -- entry next bar open")
 
 mtf_trendTxt(int t) =>
     t == 1 ? "Up" : t == -1 ? "Down" : "n/a"
 
 // ============================= DASHBOARD TABLE =============================
-var table dash = table.new(position.top_right, 2, 24, border_width = 1, bgcolor = color.new(color.black, 20))
+// Clean: compact summary. Standard: MTF engine rows. Full: legacy rows + MTF engine rows.
+var table dash = table.new(position.top_right, 2, 26, border_width = 1, bgcolor = color.new(color.black, 20))
+
+dashRow(int r, string k, string v, color c) =>
+    table.cell(dash, 0, r, k, text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, r, v, text_color = c, text_size = size.small)
 
 if barstate.islast
-    table.cell(dash, 0, 0, "COT Net", text_color = color.white)
-    table.cell(dash, 1, 0, na(cotNet) ? "off" : str.tostring(math.round(cotNet)), text_color = color.white)
-
-    table.cell(dash, 0, 1, "COT Index", text_color = color.white)
-    table.cell(dash, 1, 1, na(cotIndex) ? "n/a" : str.tostring(math.round(cotIndex)),
-         text_color = (not na(cotIndex) and (cotIndex >= 90 or cotIndex <= 10)) ? color.yellow : color.white)
-
-    table.cell(dash, 0, 2, "Cum Delta", text_color = color.white)
-    table.cell(dash, 1, 2, str.tostring(math.round(cumDelta)), text_color = cumDelta >= 0 ? color.teal : color.maroon)
-
-    table.cell(dash, 0, 3, "POC (approx)", text_color = color.white)
-    table.cell(dash, 1, 3, na(pocPriceOut) ? "n/a" : str.tostring(pocPriceOut, format.mintick), text_color = color.orange)
-
-    table.cell(dash, 0, 4, "Bin Size", text_color = color.white)
-    table.cell(dash, 1, 4, str.tostring(effectiveRowSize, format.mintick) + (autoBinSize ? " (auto)" : " (manual)"), text_color = color.gray)
-
-    table.cell(dash, 0, 5, "Active FVGs", text_color = color.white)
-    table.cell(dash, 1, 5, str.tostring(bullFvgCount) + " bull / " + str.tostring(bearFvgCount) + " bear", text_color = color.gray)
-
-    table.cell(dash, 0, 6, "Active S/D Zones", text_color = color.white)
-    table.cell(dash, 1, 6, str.tostring(supplyCount) + " sup / " + str.tostring(demandCount) + " dem", text_color = color.gray)
-
-    table.cell(dash, 0, 7, "Active Order Blocks", text_color = color.white)
-    table.cell(dash, 1, 7, str.tostring(bullObCount) + " bull / " + str.tostring(bearObCount) + " bear", text_color = color.gray)
-
-    table.cell(dash, 0, 8, "MS Trend", text_color = color.white)
-    table.cell(dash, 1, 8, msTrend == 1 ? "Up" : msTrend == -1 ? "Down" : "n/a", text_color = msTrend == 1 ? color.teal : msTrend == -1 ? color.maroon : color.gray)
-
-    table.cell(dash, 0, 9, "LRL (approx.)", text_color = color.white)
-    table.cell(dash, 1, 9, "up " + str.tostring(obstaclesAbove) + " / dn " + str.tostring(obstaclesBelow), text_color = color.gray)
-
-    table.cell(dash, 0, 10, "Last CISD", text_color = color.white)
-    table.cell(dash, 1, 10, cisdLastOut, text_color = cisdLastOut == "Bullish" ? color.aqua : cisdLastOut == "Bearish" ? color.maroon : color.gray)
-
-    // ---- MTF engine rows ----
-    table.cell(dash, 0, 11, "TF  LTF / Chart / HTF", text_color = color.white)
-    table.cell(dash, 1, 11, mtfLtfName + " / " + mtfCtfName + " / " + mtfHtfName, text_color = color.gray)
-
-    table.cell(dash, 0, 12, "Trend  LTF / Chart / HTF", text_color = color.white)
-    table.cell(dash, 1, 12, mtf_trendTxt(mtfLtfTrend) + " / " + mtf_trendTxt(cTrend) + " / " + mtf_trendTxt(mtfHtfTrend), text_color = color.gray)
-
     string alignTxt = mtfHtfTrend == 1 and cTrend == 1 and (not mtfLtfOn or mtfLtfTrend == 1) ? "Aligned Bull" : mtfHtfTrend == -1 and cTrend == -1 and (not mtfLtfOn or mtfLtfTrend == -1) ? "Aligned Bear" : "Mixed"
-    table.cell(dash, 0, 13, "Alignment", text_color = color.white)
-    table.cell(dash, 1, 13, alignTxt, text_color = alignTxt == "Aligned Bull" ? color.teal : alignTxt == "Aligned Bear" ? color.maroon : color.gray)
-
-    table.cell(dash, 0, 14, "Zones  LTF / Chart / HTF", text_color = color.white)
-    table.cell(dash, 1, 14, str.tostring(array.size(mtfZonesL)) + " / " + str.tostring(array.size(mtfZonesC)) + " / " + str.tostring(array.size(mtfZonesH)), text_color = color.gray)
-
-    table.cell(dash, 0, 15, "Newest HTF zone", text_color = color.white)
-    table.cell(dash, 1, 15, array.size(mtfZonesH) > 0 ? mtf_zoneTxt(array.last(mtfZonesH)) : "none", text_color = color.gray)
-
-    table.cell(dash, 0, 16, "Location (HTF range)", text_color = color.white)
-    table.cell(dash, 1, 16, mtf_pdTxt(close) + (na(mtfEq) ? "" : "  EQ " + str.tostring(mtfEq, format.mintick)), text_color = mtf_pdTxt(close) == "Disc" ? color.teal : mtf_pdTxt(close) == "Prem" ? color.maroon : color.gray)
-
-    table.cell(dash, 0, 17, "Setups armed / closed", text_color = color.white)
-    table.cell(dash, 1, 17, str.tostring(mtfSt.nArmed) + " / " + str.tostring(mtfSt.nTrades) + "  (exp " + str.tostring(mtfSt.nExpired) + ", rej " + str.tostring(mtfSt.nRejFilt + mtfSt.nRejRisk + mtfSt.nRejBusy) + ", canc " + str.tostring(mtfSt.nCancel) + ")", text_color = color.gray)
-
-    table.cell(dash, 0, 18, "Ledger (net R)", text_color = color.white)
-    table.cell(dash, 1, 18, mtfSt.nTrades == 0 ? "no trades" : str.tostring(mtfSt.nTrades) + " trades, exp " + str.tostring(mtfSt.sumR / mtfSt.nTrades, "#.##") + "R, maxDD " + str.tostring(mtfSt.maxDD, "#.#") + "R", text_color = mtfSt.sumR >= 0 ? color.teal : color.maroon)
-
-    table.cell(dash, 0, 19, "Model", text_color = color.white)
-    table.cell(dash, 1, 19, mtfModelTxt, text_color = color.gray)
-
-    if mtfLtfMissing > 0
-        table.cell(dash, 0, 22, "LTF bars w/o intrabars", text_color = color.white)
-        table.cell(dash, 1, 22, str.tostring(mtfLtfMissing), text_color = color.gray)
-
-    if mtfWarn != ""
-        table.cell(dash, 0, 23, "Warning", text_color = color.yellow)
-        table.cell(dash, 1, 23, mtfWarn, text_color = color.yellow)
+    color  alignCol = alignTxt == "Aligned Bull" ? color.teal : alignTxt == "Aligned Bear" ? color.maroon : color.gray
+    string locTxt   = mtf_pdTxt(close)
+    color  locCol   = locTxt == "Disc" ? color.teal : locTxt == "Prem" ? color.maroon : color.gray
+    string cfgTxt   = syminfo.ticker + " " + mtfCtfName + " · Model " + mtfModel + " · " + (mtfTrigMode == "T0 reaction close" ? "T0" : "T1") + " · " + str.tostring(mtfTargetR) + "R"
+    string lastTxt  = "none"
+    for st in mtfSetups
+        if st.state == "Triggered" or st.state == "Open"
+            lastTxt := (st.dir == 1 ? "BUY " : "SELL ") + st.grade + " #" + str.tostring(st.id) + (st.state == "Open" ? " in trade" : " entry next open")
+    if mtfModeClean
+        dashRow(0, "Bias (" + mtfHtfName + ")", mtf_trendTxt(mtfHtfTrend) + " · " + alignTxt, alignCol)
+        dashRow(1, "Nearest Buy Zone", array.get(mtfNearTxt, 0), color.teal)
+        dashRow(2, "Nearest Sell Zone", array.get(mtfNearTxt, 1), color.maroon)
+        dashRow(3, "Location", locTxt, locCol)
+        dashRow(4, "A+ results", mtf_gradeStatTxt("A+"), color.gray)
+        dashRow(5, "A results", mtf_gradeStatTxt("A"), color.gray)
+        dashRow(6, "Open setup", lastTxt, color.white)
+        dashRow(7, "Config", cfgTxt, color.gray)
+        if mtfWarn != ""
+            dashRow(8, "Warning", mtfWarn, color.yellow)
+    else
+        int o = 0
+        if mtfModeFull
+            dashRow(0, "COT Net", not cotOn ? (enableCOT ? "off (not futures)" : "off") : na(cotNet) ? "n/a" : str.tostring(math.round(cotNet)), color.white)
+            dashRow(1, "COT Index", na(cotIndex) ? "n/a" : str.tostring(math.round(cotIndex)), (not na(cotIndex) and (cotIndex >= 90 or cotIndex <= 10)) ? color.yellow : color.white)
+            dashRow(2, "Cum Delta", str.tostring(math.round(cumDelta)), cumDelta >= 0 ? color.teal : color.maroon)
+            dashRow(3, "POC (approx)", na(pocPriceOut) ? "n/a" : str.tostring(pocPriceOut, format.mintick), color.orange)
+            dashRow(4, "Bin Size", str.tostring(effectiveRowSize, format.mintick) + (autoBinSize ? " (auto)" : " (manual)"), color.gray)
+            dashRow(5, "Legacy FVGs", str.tostring(bullFvgCount) + " bull / " + str.tostring(bearFvgCount) + " bear", color.gray)
+            dashRow(6, "Legacy S/D Zones", str.tostring(supplyCount) + " sup / " + str.tostring(demandCount) + " dem", color.gray)
+            dashRow(7, "Legacy Order Blocks", str.tostring(bullObCount) + " bull / " + str.tostring(bearObCount) + " bear", color.gray)
+            dashRow(8, "MS Trend", msTrend == 1 ? "Up" : msTrend == -1 ? "Down" : "n/a", msTrend == 1 ? color.teal : msTrend == -1 ? color.maroon : color.gray)
+            dashRow(9, "LRL (approx.)", "up " + str.tostring(obstaclesAbove) + " / dn " + str.tostring(obstaclesBelow), color.gray)
+            dashRow(10, "Last CISD", cisdLastOut, cisdLastOut == "Bullish" ? color.aqua : cisdLastOut == "Bearish" ? color.maroon : color.gray)
+            o := 11
+        dashRow(o + 0, "TF  LTF / Chart / HTF", mtfLtfName + " / " + mtfCtfName + " / " + mtfHtfName, color.gray)
+        dashRow(o + 1, "Trend  LTF / Chart / HTF", mtf_trendTxt(mtfLtfTrend) + " / " + mtf_trendTxt(cTrend) + " / " + mtf_trendTxt(mtfHtfTrend), color.gray)
+        dashRow(o + 2, "Alignment", alignTxt, alignCol)
+        dashRow(o + 3, "Nearest Buy / Sell Zone", array.get(mtfNearTxt, 0) + "  |  " + array.get(mtfNearTxt, 1), color.gray)
+        dashRow(o + 4, "Location (HTF range)", locTxt + (na(mtfEq) ? "" : "  EQ " + str.tostring(mtfEq, format.mintick)), locCol)
+        dashRow(o + 5, "A+ / A results", mtf_gradeStatTxt("A+") + "  |  " + mtf_gradeStatTxt("A"), color.gray)
+        dashRow(o + 6, "Setups armed / closed", str.tostring(mtfSt.nArmed) + " / " + str.tostring(mtfSt.nTrades) + "  (exp " + str.tostring(mtfSt.nExpired) + ", rej " + str.tostring(mtfSt.nRejFilt + mtfSt.nRejRisk + mtfSt.nRejBusy) + ", canc " + str.tostring(mtfSt.nCancel) + ")", color.gray)
+        dashRow(o + 7, "Ledger (all grades)", mtfSt.nTrades == 0 ? "no trades" : str.tostring(mtfSt.nTrades) + " trades, exp " + str.tostring(mtfSt.sumR / mtfSt.nTrades, "+0.00;-0.00") + "R, maxDD " + str.tostring(mtfSt.maxDD, "0.0") + "R, ambiguous " + str.tostring(mtfSt.nAmbig), mtfSt.sumR >= 0 ? color.teal : color.maroon)
+        dashRow(o + 8, "Config", cfgTxt + "  " + mtfModelTxt, color.gray)
+        if mtfModeFull
+            dashRow(o + 9, "Newest HTF zone", array.size(mtfZonesH) > 0 ? mtf_zoneTxt(array.last(mtfZonesH)) : "none", color.gray)
+            dashRow(o + 10, "Zones  LTF / Chart / HTF", str.tostring(array.size(mtfZonesL)) + " / " + str.tostring(array.size(mtfZonesC)) + " / " + str.tostring(array.size(mtfZonesH)), color.gray)
+            if mtfLtfMissing > 0
+                dashRow(o + 11, "LTF bars w/o intrabars", str.tostring(mtfLtfMissing), color.gray)
+        if mtfWarn != ""
+            dashRow(o + 12, "Warning", mtfWarn, color.yellow)

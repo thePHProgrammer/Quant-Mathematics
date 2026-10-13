@@ -138,7 +138,8 @@ Armed ──T(trigger)──▶ Triggered ──next open──▶ Open ──�
 - **AOI** = a valid HTF zone. In `HTF zone ∩ lower-TF zone` mode, the AOI is only the largest overlap
   with a valid same-direction chart-TF or LTF zone. If no overlap exists when the zone is touched,
   no setup is armed.
-- The AOI label shows **4 categories**, not a summed point score:
+- On the chart an AOI is drawn as a **BUY ZONE / SELL ZONE** with its quality grade and setup
+  status (§15). The 4 categories below describe the AOI → setup path:
 
 | Cat. | Meaning | Role |
 |---|---|---|
@@ -253,7 +254,7 @@ Stats table (strategy, top-right), all in net R:
 
 **Event log.** Every terminal setup writes one CSV line to **Pine Logs** (both scripts):
 ```
-SETUP,id,dir,state,reason,zone,trigTime,entry,stop,target,exit,R,holdBars,MAE_R,MFE_R,ambiguous,fStruct,fSweep,fPD,fDisp,fCE,session
+SETUP,id,dir,state,reason,zone,trigTime,entry,stop,target,exit,R,holdBars,MAE_R,MFE_R,ambiguous,fStruct,fSweep,fPD,fDisp,fCE,session,grade,period
 ```
 Filter Pine Logs by `SETUP,`, export the lines, and analyse them offline (e.g. pandas: bootstrap
 confidence intervals on expectancy, results by regime, per-feature logistic regression).
@@ -321,3 +322,101 @@ unproven.
   institutional activity.
 - The R ledger and TradingView's tester can differ on ambiguous bars, on trades whose size rounds to
   0, and on spread handling. The ledger is the primary metric.
+
+---
+
+## 15. Buy/Sell Zones: display modes, quality grade, setup status, results
+
+Three separate things are shown for each zone, and they are never mixed:
+
+| | Question it answers | Source |
+|---|---|---|
+| **Quality grade** (A+ / A / B) | How good is the *context* right now? | 4 checks below, recomputed each closed bar |
+| **Setup status** | Is there an actual trade? | Setup lifecycle (§5.3) |
+| **Results** | How did past setups *of this grade* end, under these exact settings? | R ledger (§9–10) |
+
+### 15.1 Quality grade
+Each valid HTF zone, i.e. each AOI candidate, gets 4 checks. Every check uses only values known on
+the current closed bar.
+
+| Check | Buy zone passes when (Sell = mirror) |
+|---|---|
+| Overlap | A valid bullish chart-TF or LTF OB/FVG overlaps the zone now. |
+| Trend | HTF structure trend is up now. |
+| Location | The zone midpoint is in Discount of the current HTF dealing range. |
+| Zone sweep | A bullish sweep (wick below the latest confirmed chart-TF swing low, close back above) whose wick reached **into this zone, or within `sweepTol × ATR` below it**. It must come after the zone was confirmed and within the last `sweepBars` bars. A sweep elsewhere on the chart doesn't count. |
+
+**A+** = 4/4, **A** = 3/4, **B** = ≤ 2/4.
+- A zone ahead of price is typically **A**. It becomes A+ when price sweeps liquidity into it.
+- The grade can go up or down from bar to bar. Past bars are never revised.
+- The grade describes context. It is **not** a probability.
+
+### 15.2 Setup status
+| Status | Meaning |
+|---|---|
+| Waiting | No setup on this zone yet. |
+| Armed | Price came back into the zone; waiting for the trigger. |
+| In trade | Triggered (entry next open) or open. |
+| Traded | The zone's setup has closed. |
+| Expired / Rejected | The touch produced no trade: no trigger in the window, or it failed a filter, the risk gate, or a position was already open. |
+
+### 15.3 Results per grade
+- **Population**: setups closed by the engine on *this chart load*. That fixes the symbol, chart TF,
+  model, trigger, stop/target/time exit and ledger costs to the current settings. Nothing from other
+  settings is pooled. The configuration is shown as `Config` in the dashboard.
+- **Grade attribution**: the zone's grade on the setup's **trigger bar**.
+- **Win rate** = winning closed trades ÷ all closed trades of that grade, rounded to a whole %.
+  **Avg R** = mean net R per closed trade, costs included. **n** = number of closed trades.
+  Open, expired, rejected and cancelled setups are excluded. A bar touching both stop and target is a loss.
+- **In-sample / out-of-sample**: trades are split by trigger time against the *IS / OOS split* date.
+  Labels show **out-of-sample** stats once there are ≥ 20 OOS trades; otherwise in-sample stats are
+  shown and marked `in-sample`. Fewer than 20 trades is marked `low sample`. OOS figures are only
+  out-of-sample if no rule or setting was tuned on data after the split date.
+- `won 61% of 38` means 23 of 38 past trades won. It does **not** mean the next trade has a 61% chance.
+- The indicator and strategy run the same engine block, so trigger times and outcomes match.
+  TradingView's tester can still differ on ambiguous bars (§9).
+
+### 15.4 Display modes (drawings only)
+| Element | Clean (default) | Standard | Full |
+|---|---|---|---|
+| Buy/Sell Zones with grade ≥ *Show zones with quality grade ≥* (default A) | nearest *N* per side (default 2) | nearest *N* per side | all graded zones, incl. B |
+| ▲/▼ markers, stop/target lines | setups with a shown grade | same | all setups |
+| Raw HTF zones and swings | – | ✓ | ✓ |
+| Chart-TF / LTF zones and swings, developing HTF, EQ lines | – | – | ✓ |
+| Premium/Discount, OTE | – | ✓ | ✓ |
+| Legacy sections (VP, S/D, BOS/CHoCH, CISD, SMT, Kill Zones, legacy FVG/OB, LRL) | – | – | each behind its own toggle |
+| Dashboard | compact | MTF rows | legacy + MTF rows |
+
+- Gates act where objects are **created**, so hidden objects are never created.
+- **Merging** is display-only: overlapping zones with the same direction and the same grade are drawn as
+  one box listing its members. Setups and stats stay attributed to each individual zone.
+- **Ranking**: distance from the close to the zone's nearest edge. A zone price is inside ranks first (distance 0).
+- **Touch highlight**: a stronger fill while price is in the zone, based on closed-bar state only.
+- **Grade diagnostics** (any mode) adds the 4 checks to each label, e.g. `Overlap ✓ Trend ✓ Discount ✗ Sweep ✓`.
+- Zones, grades, setups, the ledger and Strategy Tester results are identical in every mode.
+
+### 15.5 Grade as a trading filter (separate experiment)
+In the strategy, *Research: trade only grade ≥* is `All` by default. Setting it to `A` or `A+` is an
+experiment **outside** the A–F ladder: the grade already contains Struct, P/D and a sweep, so
+combining it with models B–F double-counts them. Compare it against Model A with `All`, IS → OOS.
+
+### 15.6 Release checklist (Buy/Sell Zones)
+**Grading**
+- [ ] A+ requires all 4 checks; A requires 3.
+- [ ] A sweep counts only for the zone and direction it belongs to.
+- [ ] Grades use only information available at that bar.
+
+**Performance**
+- [ ] Win rate and avg R come from closed trades under the defined exit rules, with costs.
+- [ ] Stats are limited to the current symbol / TF / model / rules / costs, and the config is shown.
+- [ ] IS and OOS are clearly separated and labelled.
+
+**Display**
+- [ ] Clean shows only eligible zones and relevant trade markers.
+- [ ] Standard and Full reveal detail without changing trading decisions.
+- [ ] Merging and nearest-zone selection preserve zone identity and correct ranking.
+
+**Reliability**
+- [ ] COT is safely disabled for unsupported symbols (default off; the library is only reached on futures or with a manual CFTC code).
+- [ ] Indicator and strategy agree on signal timestamps and outcomes.
+- [ ] Changing display mode leaves Strategy Tester results unchanged.
